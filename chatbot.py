@@ -15,6 +15,7 @@ Run:  python chatbot.py
 
 import os
 import ast
+import time
 import operator
 
 from google import genai
@@ -29,6 +30,8 @@ load_dotenv()
 # CONFIGURATION
 # ─────────────────────────────────────────
 MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+FALLBACK_MODEL = "gemini-2.5-flash-lite"  # tried if the main model is overloaded
+MAX_RETRIES = 4                            # attempts per model on transient errors
 
 SYSTEM_PROMPT = """You are a helpful, friendly AI assistant with two tools:
 - web_search: use it for recent news, current events, live prices, or anything
@@ -192,6 +195,36 @@ def trim_history() -> None:
         conversation_history.pop(0)
 
 
+
+# ─────────────────────────────────────────
+# RESILIENT MODEL CALL (handles 503 with retries + fallback)
+# ─────────────────────────────────────────
+def generate_with_retry(history):
+    """Call Gemini, retrying on transient 503/429 errors and falling back
+    to a lighter model if the primary one stays overloaded."""
+    last_error = None
+    for model_name in (MODEL, FALLBACK_MODEL):
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                return client.models.generate_content(
+                    model=model_name, contents=history, config=CONFIG
+                )
+            except genai_errors.APIError as e:
+                msg = str(e)
+                transient = ("503" in msg or "UNAVAILABLE" in msg or "429" in msg
+                             or "overloaded" in msg.lower() or "high demand" in msg.lower())
+                if not transient:
+                    raise
+                last_error = e
+                if attempt < MAX_RETRIES:
+                    wait = 2 ** (attempt - 1)
+                    print(f"  ⏳ Model busy, retrying in {wait}s "
+                          f"(try {attempt}/{MAX_RETRIES})...", flush=True)
+                    time.sleep(wait)
+        print(f"  ↪ Switching to backup model: {FALLBACK_MODEL}", flush=True)
+    raise last_error
+
+
 # ─────────────────────────────────────────
 # CHAT (agentic loop)
 # ─────────────────────────────────────────
@@ -204,11 +237,7 @@ def chat(user_message: str) -> None:
 
     try:
         while True:
-            response = client.models.generate_content(
-                model=MODEL,
-                contents=conversation_history,
-                config=CONFIG,
-            )
+            response = generate_with_retry(conversation_history)
 
             model_content = response.candidates[0].content
             conversation_history.append(model_content)
