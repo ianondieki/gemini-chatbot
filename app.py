@@ -217,7 +217,8 @@ def run_agent(client, tavily, history, status):
 
 
 # PAGE CONFIG + STYLING
-st.set_page_config(page_title=APP_NAME, page_icon="A", layout="centered")
+st.set_page_config(page_title=APP_NAME, page_icon="A", layout="centered",
+                   initial_sidebar_state="expanded")
 
 st.markdown(
     """
@@ -332,17 +333,22 @@ if "history" not in st.session_state:
 if "display" not in st.session_state:
     st.session_state.display = []
 
-# SIDEBAR
+# Main-area Clear button: always visible, including on mobile where the
+# sidebar is collapsed. Centered under the hero using a middle column.
+_left, _mid, _right = st.columns([1, 2, 1])
+with _mid:
+    if st.button("Clear conversation", use_container_width=True, key="clear_main"):
+        st.session_state.history = []
+        st.session_state.display = []
+        st.rerun()
+
+# SIDEBAR (extra info; optional on mobile)
 with st.sidebar:
     st.markdown("## Angel")
     st.caption(f"Model - {MODEL}")
     st.markdown("**Abilities**")
     st.markdown("Web search\n\nCalculator")
     st.divider()
-    if st.button("Clear conversation", use_container_width=True):
-        st.session_state.history = []
-        st.session_state.display = []
-        st.rerun()
     st.caption("Angel can search the live web and do exact math. Ask anything.")
 
 # CHAT
