@@ -202,7 +202,7 @@ def run_agent(client, tavily, history, status):
                     result = do_search(tavily, q)
                 elif call.name == "calculate":
                     expr = args.get("expression", "")
-                    status.write(f"Calculating - *{expr}*")
+                    status.write(f"Newton's Brain calculating - *{expr}*")
                     result = do_calculate(expr)
                 else:
                     result = f"Unknown tool: {call.name}"
@@ -218,7 +218,7 @@ def run_agent(client, tavily, history, status):
 
 # PAGE CONFIG + STYLING
 st.set_page_config(page_title=APP_NAME, page_icon="A", layout="centered",
-                   initial_sidebar_state="expanded")
+                   initial_sidebar_state="collapsed")
 
 st.markdown(
     """
@@ -301,6 +301,34 @@ st.markdown(
         box-shadow: 0 4px 16px rgba(160,130,230,0.3);
         transform: translateY(-1px);
       }
+      /* Hide the sidebar entirely (mobile-friendly: nothing to toggle) */
+      [data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"] { display: none !important; }
+      /* Ability cards in the main area */
+      .angel-cards {
+        display: flex; gap: 0.8rem; justify-content: center;
+        flex-wrap: wrap; margin: 0.2rem 0 1.4rem;
+      }
+      .angel-card {
+        flex: 1 1 200px; max-width: 300px;
+        background: rgba(255,255,255,0.6);
+        border: 1px solid rgba(200,182,255,0.35);
+        border-radius: 18px; padding: 1rem 1.2rem;
+        box-shadow: 0 6px 22px rgba(140,120,200,0.10);
+        backdrop-filter: blur(6px);
+        transition: transform 0.2s ease, box-shadow 0.2s ease;
+      }
+      .angel-card:hover {
+        transform: translateY(-3px);
+        box-shadow: 0 10px 28px rgba(160,130,230,0.22);
+      }
+      .angel-card-title {
+        font-family: 'Cormorant Garamond', serif; font-weight: 600;
+        font-size: 1.25rem; color: var(--angel-ink); margin-bottom: 0.2rem;
+      }
+      .angel-card-desc {
+        font-family: 'Outfit', sans-serif; font-weight: 300;
+        font-size: 0.92rem; color: var(--angel-soft);
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -333,23 +361,30 @@ if "history" not in st.session_state:
 if "display" not in st.session_state:
     st.session_state.display = []
 
-# Main-area Clear button: always visible, including on mobile where the
-# sidebar is collapsed. Centered under the hero using a middle column.
+# Ability cards in the main area (replaces the sidebar; always visible on mobile)
+st.markdown(
+    """
+    <div class="angel-cards">
+      <div class="angel-card">
+        <div class="angel-card-title">Web search</div>
+        <div class="angel-card-desc">Live results from across the web for anything current.</div>
+      </div>
+      <div class="angel-card">
+        <div class="angel-card-title">Newton&#39;s Brain</div>
+        <div class="angel-card-desc">Exact math, calculated with Newton-grade precision.</div>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# Centered Clear button under the cards.
 _left, _mid, _right = st.columns([1, 2, 1])
 with _mid:
     if st.button("Clear conversation", use_container_width=True, key="clear_main"):
         st.session_state.history = []
         st.session_state.display = []
         st.rerun()
-
-# SIDEBAR (extra info; optional on mobile)
-with st.sidebar:
-    st.markdown("## Angel")
-    st.caption(f"Model - {MODEL}")
-    st.markdown("**Abilities**")
-    st.markdown("Web search\n\nCalculator")
-    st.divider()
-    st.caption("Angel can search the live web and do exact math. Ask anything.")
 
 # CHAT
 if not st.session_state.display:

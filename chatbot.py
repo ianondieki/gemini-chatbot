@@ -153,7 +153,7 @@ def _safe_eval(node):
 
 def do_calculate(expression: str) -> str:
     """Safely evaluate an arithmetic expression."""
-    print(f"\n  🧮 Calculating: {expression}", flush=True)
+    print(f"\n  🧮 Newton's Brain calculating: {expression}", flush=True)
     try:
         tree = ast.parse(expression, mode="eval")
         result = _safe_eval(tree.body)
@@ -273,7 +273,7 @@ def chat(user_message: str) -> None:
 # ─────────────────────────────────────────
 def print_welcome() -> None:
     print("\n" + "=" * 52)
-    print("   🤖  CLI Chatbot — Gemini + Search + Calculator")
+    print("   🤖  CLI Chatbot — Gemini + Search + Newton's Brain")
     print("=" * 52)
     print(f"  Model: {MODEL}")
     print("  Tools: web_search, calculate")
