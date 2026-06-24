@@ -27,6 +27,8 @@ from google.genai import types
 from google.genai import errors as genai_errors
 from dotenv import load_dotenv
 
+import agent_core as core  # shared Gemini voice helpers (STT/TTS)
+
 load_dotenv()
 
 # CONFIGURATION
@@ -196,6 +198,8 @@ def main():
     for key in ("rag_chunks", "rag_emb", "rag_file", "rag_msgs"):
         if key not in st.session_state:
             st.session_state[key] = None if key != "rag_msgs" else []
+    if "rag_last_audio_id" not in st.session_state:
+        st.session_state.rag_last_audio_id = None  # dedupe recordings
 
     uploaded = st.file_uploader("Upload a PDF", type="pdf")
 
@@ -270,11 +274,38 @@ def main():
                 )
 
     if st.session_state.rag_chunks is not None:
+        st.toggle("🔊 Voice replies", key="rag_voice_on",
+                  help="Speak the answer aloud (Gemini text-to-speech).")
+        audio_in = st.audio_input("🎙️ Or ask out loud", key="rag_mic")
+
         for m in st.session_state.rag_msgs:
             with st.chat_message(m["role"]):
                 st.markdown(m["text"])
 
-        if q := st.chat_input("Ask a question about the document..."):
+        # Resolve the question from the text box or the microphone. Typed text
+        # wins; a new recording is transcribed once (deduped by content hash).
+        typed = st.chat_input("Ask a question about the document...")
+        q = typed
+        if not typed and audio_in is not None:
+            audio_bytes = audio_in.getvalue()
+            audio_id = hashlib.sha256(audio_bytes).hexdigest()
+            if audio_id != st.session_state.rag_last_audio_id:
+                st.session_state.rag_last_audio_id = audio_id
+                with st.spinner("Transcribing your voice..."):
+                    try:
+                        spoken = core.transcribe_audio(
+                            client, audio_bytes,
+                            mime_type=getattr(audio_in, "type", None) or "audio/wav",
+                        )
+                    except Exception as e:
+                        spoken = ""
+                        st.warning(f"Could not transcribe the recording: {e}")
+                if spoken:
+                    q = spoken
+                else:
+                    st.info("I couldn't make out any words — try again.")
+
+        if q:
             st.session_state.rag_msgs.append({"role": "user", "text": q})
             with st.chat_message("user"):
                 st.markdown(q)
@@ -291,6 +322,15 @@ def main():
                         answer, idx, scores = f"API error: {e}", [], []
 
                 st.markdown(answer)
+
+                # Speak the answer if voice replies are on (never break on TTS).
+                if st.session_state.get("rag_voice_on") and not answer.startswith("API error"):
+                    with st.spinner("Generating voice..."):
+                        wav = core.synthesize_speech(client, answer)
+                    if wav:
+                        st.audio(wav, format="audio/wav", autoplay=True)
+                    else:
+                        st.caption("🔇 Voice reply unavailable right now.")
 
                 if len(idx) > 0:
                     with st.expander("Sources used (retrieved chunks)"):
