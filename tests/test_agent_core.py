@@ -11,7 +11,7 @@ import math
 import pytest
 
 import agent_core as core
-from agent_core import do_calculate, trim_history
+from agent_core import do_calculate, do_search, is_search_error, trim_history
 from google.genai import types
 
 
@@ -58,6 +58,44 @@ def test_calculate_handles_syntax_error():
 
 def test_calculate_division_by_zero_is_caught():
     assert do_calculate("1 / 0").startswith("Calculation error")
+
+
+# ─────────────────────────────────────────
+# Web search: success formatting and explicit failure signalling
+# ─────────────────────────────────────────
+class _FakeTavily:
+    def __init__(self, payload=None, exc=None):
+        self._payload, self._exc = payload, exc
+
+    def search(self, **kwargs):
+        if self._exc:
+            raise self._exc
+        return self._payload
+
+
+def test_do_search_formats_results():
+    tav = _FakeTavily(payload={
+        "answer": "42",
+        "results": [{"title": "T", "url": "http://x", "content": "body"}],
+    })
+    out = do_search(tav, "meaning of life")
+    assert not is_search_error(out)
+    assert "Quick answer: 42" in out
+    assert "http://x" in out
+
+
+def test_do_search_no_results():
+    out = do_search(_FakeTavily(payload={"results": []}), "q")
+    assert out == "No results found."
+    assert not is_search_error(out)
+
+
+def test_do_search_failure_is_flagged_and_instructive():
+    out = do_search(_FakeTavily(exc=RuntimeError("network down")), "q")
+    assert is_search_error(out)
+    assert "network down" in out
+    # the model must be told not to fabricate a live answer
+    assert "do not invent" in out.lower()
 
 
 # ─────────────────────────────────────────
@@ -153,3 +191,47 @@ def test_top_k_chunks_ranks_by_cosine_similarity():
     assert math.isclose(scores[0], 1.0, rel_tol=1e-5)
     # scores are returned in descending order
     assert scores[0] >= scores[1]
+
+
+# ─────────────────────────────────────────
+# RAG: embedding cache roundtrip
+# ─────────────────────────────────────────
+def test_cache_miss_then_roundtrip(tmp_path):
+    rag = _rag()
+    np = pytest.importorskip("numpy")
+    cache_dir = str(tmp_path / "cache")
+    file_id = "book.pdf-12345"
+    chunks = ["alpha", "beta", "gamma"]
+    embeddings = np.array([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]], dtype="float32")
+
+    # Cold cache -> miss.
+    assert rag.load_cache(file_id, cache_dir=cache_dir) is None
+
+    rag.save_cache(file_id, chunks, embeddings, cache_dir=cache_dir)
+
+    loaded = rag.load_cache(file_id, cache_dir=cache_dir)
+    assert loaded is not None
+    loaded_chunks, loaded_emb = loaded
+    assert loaded_chunks == chunks
+    assert np.allclose(loaded_emb, embeddings)
+
+
+def test_cache_key_invalidates_on_param_change(tmp_path, monkeypatch):
+    rag = _rag()
+    # Different MAX_CHUNKS must produce a different cache key, so a config
+    # change never serves a stale index.
+    monkeypatch.setattr(rag, "MAX_CHUNKS", 1200)
+    key_a = rag._cache_key("book.pdf-1")
+    monkeypatch.setattr(rag, "MAX_CHUNKS", 5000)
+    key_b = rag._cache_key("book.pdf-1")
+    assert key_a != key_b
+
+
+def test_corrupt_cache_is_treated_as_miss(tmp_path):
+    rag = _rag()
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    key = rag._cache_key("x.pdf-1")
+    (cache_dir / f"{key}.chunks.json").write_text("{not valid json")
+    (cache_dir / f"{key}.emb.npy").write_bytes(b"garbage")
+    assert rag.load_cache("x.pdf-1", cache_dir=str(cache_dir)) is None

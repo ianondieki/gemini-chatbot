@@ -99,8 +99,20 @@ def build_config(system_prompt: str = DEFAULT_SYSTEM_PROMPT) -> types.GenerateCo
 # ─────────────────────────────────────────
 # TOOL 1: WEB SEARCH
 # ─────────────────────────────────────────
+SEARCH_ERROR_PREFIX = "Search error:"
+
+
+def is_search_error(result: str) -> bool:
+    """True if a do_search result represents a failure rather than results."""
+    return result.startswith(SEARCH_ERROR_PREFIX)
+
+
 def do_search(tavily, query: str) -> str:
-    """Run a Tavily web search and return formatted results (pure: no printing)."""
+    """Run a Tavily web search and return formatted results (pure: no printing).
+
+    On failure the result is prefixed with SEARCH_ERROR_PREFIX and instructs the
+    model to tell the user the search failed — so a transient Tavily outage
+    can't be silently turned into a confidently-wrong "live" answer."""
     try:
         results = tavily.search(query=query, max_results=5, include_answer="basic")
         parts = []
@@ -114,7 +126,11 @@ def do_search(tavily, query: str) -> str:
             )
         return "\n---\n".join(parts) if parts else "No results found."
     except Exception as e:
-        return f"Search error: {e}"
+        return (
+            f"{SEARCH_ERROR_PREFIX} {e}. The web search did not return results. "
+            "Tell the user the live search failed and that you could not retrieve "
+            "current information — do not invent an answer from memory."
+        )
 
 
 # ─────────────────────────────────────────
@@ -253,6 +269,8 @@ def run_agent(client, tavily, history, config, notify=None,
                 if notify:
                     notify(f"Searching the web — {q}")
                 result = do_search(tavily, q)
+                if notify and is_search_error(result):
+                    notify("⚠️ Web search failed — answering without live results.")
             elif call.name == "calculate":
                 expr = args.get("expression", "")
                 if notify:

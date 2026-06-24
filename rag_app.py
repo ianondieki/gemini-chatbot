@@ -15,7 +15,9 @@ Run:  streamlit run rag_app.py
 """
 
 import os
+import json
 import time
+import hashlib
 
 import numpy as np
 import streamlit as st
@@ -39,7 +41,13 @@ TOP_K = 4
 EMBED_BATCH = 10          # chunks per embedding request (smaller = safer)
 INTER_BATCH_DELAY = 0.3   # seconds to pause between batches (eases rate limits)
 EMBED_RETRIES = 5         # attempts per batch on transient errors
-MAX_CHUNKS = 1200         # safety cap; books past this index only the first part
+# Safety cap on how many chunks we EMBED. The brute-force NumPy search handles
+# far more than this fine — the cap exists purely to keep embedding within
+# free-tier quota. Raise it (RAG_MAX_CHUNKS) if your quota allows.
+MAX_CHUNKS = int(os.getenv("RAG_MAX_CHUNKS", "1200"))
+
+# On-disk cache so re-uploading the same PDF skips re-embedding (slow + quota).
+CACHE_DIR = os.getenv("RAG_CACHE_DIR", ".rag_cache")
 
 SYSTEM_RULE = (
     "You answer questions about an uploaded document. Use ONLY the context "
@@ -135,6 +143,41 @@ def answer_question(client, question, chunks, embeddings):
     return resp.text, idx, scores
 
 
+# 6. EMBEDDING CACHE (so re-uploading the same PDF is instant)
+# The key folds in the file id AND the indexing parameters, so changing the
+# embed model, dimension, or chunk size correctly invalidates a stale cache.
+def _cache_key(file_id):
+    raw = f"{file_id}|{EMBED_MODEL}|{EMBED_DIM}|{CHUNK_SIZE}|{CHUNK_OVERLAP}|{MAX_CHUNKS}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def load_cache(file_id, cache_dir=CACHE_DIR):
+    """Return (chunks, embeddings) for this file if cached, else None."""
+    base = os.path.join(cache_dir, _cache_key(file_id))
+    chunks_path, emb_path = base + ".chunks.json", base + ".emb.npy"
+    if not (os.path.exists(chunks_path) and os.path.exists(emb_path)):
+        return None
+    try:
+        with open(chunks_path, encoding="utf-8") as f:
+            chunks = json.load(f)
+        embeddings = np.load(emb_path)
+        return chunks, embeddings
+    except Exception:
+        return None  # corrupt/partial cache — treat as a miss and re-embed
+
+
+def save_cache(file_id, chunks, embeddings, cache_dir=CACHE_DIR):
+    """Persist chunks + embeddings; best-effort (cache failures never block use)."""
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        base = os.path.join(cache_dir, _cache_key(file_id))
+        with open(base + ".chunks.json", "w", encoding="utf-8") as f:
+            json.dump(chunks, f)
+        np.save(base + ".emb.npy", embeddings)
+    except Exception:
+        pass
+
+
 # UI
 # Wrapped in main() so the pure functions above (chunk_text, top_k_chunks, ...)
 # can be imported by tests without executing any Streamlit code. `streamlit run
@@ -160,45 +203,54 @@ def main():
         file_id = f"{uploaded.name}-{uploaded.size}"
         if st.session_state.rag_file != file_id:
             with st.status("Indexing your PDF...", expanded=True) as status:
-                status.write("Reading text from the PDF...")
-                reader = PdfReader(uploaded)
-                raw = "\n".join((page.extract_text() or "") for page in reader.pages)
-
-                if not raw.strip():
-                    status.update(label="No selectable text found", state="error")
-                    st.warning(
-                        "This PDF has no extractable text (it may be scanned images). "
-                        "Try a text-based PDF."
-                    )
-                    st.stop()
-
-                status.write("Splitting into chunks...")
-                chunks = chunk_text(raw)
-
-                # Cap very large documents so indexing stays within free-tier limits.
                 capped = False
-                if len(chunks) > MAX_CHUNKS:
-                    capped = True
-                    chunks = chunks[:MAX_CHUNKS]
 
-                status.write(f"Embedding {len(chunks)} chunks (this can take a while)...")
-                bar = st.progress(0.0)
+                # Fast path: this exact PDF was indexed before — load from disk.
+                cached = load_cache(file_id)
+                if cached is not None:
+                    status.write("Found a cached index — loading instead of re-embedding...")
+                    chunks, embeddings = cached
+                else:
+                    status.write("Reading text from the PDF...")
+                    reader = PdfReader(uploaded)
+                    raw = "\n".join((page.extract_text() or "") for page in reader.pages)
 
-                def _update(done, total):
-                    bar.progress(done / total, text=f"Embedded {done}/{total} chunks")
+                    if not raw.strip():
+                        status.update(label="No selectable text found", state="error")
+                        st.warning(
+                            "This PDF has no extractable text (it may be scanned images). "
+                            "Try a text-based PDF."
+                        )
+                        st.stop()
 
-                try:
-                    embeddings = embed_texts(
-                        client, chunks, task_type="RETRIEVAL_DOCUMENT", progress=_update
-                    )
-                except genai_errors.APIError as e:
-                    status.update(label="Embedding failed", state="error")
-                    st.error(
-                        f"Embedding error after retries: {e}\n\n"
-                        "This usually means the free-tier rate limit was hit. "
-                        "Try a smaller PDF, or wait a minute and re-upload."
-                    )
-                    st.stop()
+                    status.write("Splitting into chunks...")
+                    chunks = chunk_text(raw)
+
+                    # Cap very large documents so embedding stays within free-tier quota.
+                    if len(chunks) > MAX_CHUNKS:
+                        capped = True
+                        chunks = chunks[:MAX_CHUNKS]
+
+                    status.write(f"Embedding {len(chunks)} chunks (this can take a while)...")
+                    bar = st.progress(0.0)
+
+                    def _update(done, total):
+                        bar.progress(done / total, text=f"Embedded {done}/{total} chunks")
+
+                    try:
+                        embeddings = embed_texts(
+                            client, chunks, task_type="RETRIEVAL_DOCUMENT", progress=_update
+                        )
+                    except genai_errors.APIError as e:
+                        status.update(label="Embedding failed", state="error")
+                        st.error(
+                            f"Embedding error after retries: {e}\n\n"
+                            "This usually means the free-tier rate limit was hit. "
+                            "Try a smaller PDF, or wait a minute and re-upload."
+                        )
+                        st.stop()
+
+                    save_cache(file_id, chunks, embeddings)
 
                 st.session_state.rag_chunks = chunks
                 st.session_state.rag_emb = embeddings
