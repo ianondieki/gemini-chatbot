@@ -310,3 +310,55 @@ def test_synthesize_speech_returns_none_on_failure():
 def test_synthesize_speech_returns_none_on_empty_audio():
     resp = _NS(candidates=[_NS(content=_NS(parts=[_NS(inline_data=_NS(data=b""))]))])
     assert synthesize_speech(_FakeClient(response=resp), "x") is None
+
+
+# ─────────────────────────────────────────
+# Agentic loop integration (the heart of the app) — driven by a scripted
+# fake client, so the full model -> tool -> feed-back -> answer cycle is
+# exercised offline.
+# ─────────────────────────────────────────
+def _resp(content, function_calls=None, text=None):
+    return _NS(candidates=[_NS(content=content)],
+               function_calls=function_calls or [], text=text)
+
+
+class _ScriptedClient:
+    """Returns a queued response per generate_content call."""
+    def __init__(self, steps):
+        self._steps = list(steps)
+        self.models = self
+
+    def generate_content(self, model, contents, config=None):
+        return self._steps.pop(0)
+
+
+def test_run_agent_runs_tool_then_answers():
+    tav = _FakeTavily(payload={"results": [{"title": "t", "url": "u", "content": "42"}]})
+    call = _NS(name="web_search", args={"query": "answer to life"})
+    steps = [
+        _resp(_model("(searching)"), function_calls=[call]),  # round 1: tool
+        _resp(_model("It's 42."), text="It's 42."),           # round 2: answer
+    ]
+    history = [_user("what is the answer to life?")]
+    out = core.run_agent(_ScriptedClient(steps), tav, history,
+                         core.build_config(), notify=lambda m: None)
+    assert out == "It's 42."
+    # user -> model(call) -> tool-result(user) -> model(answer)
+    assert len(history) == 4
+    assert any(getattr(p, "function_response", None)
+               for c in history for p in (c.parts or []))
+
+
+def test_run_agent_honors_max_rounds_cap():
+    # A model that never stops calling tools must hit the safety cap, not loop.
+    class _Always:
+        def __init__(self):
+            self.models = self
+
+        def generate_content(self, model, contents, config=None):
+            call = _NS(name="calculate", args={"expression": "1+1"})
+            return _resp(_model("(loop)"), function_calls=[call])
+
+    out = core.run_agent(_Always(), None, [_user("go")],
+                         core.build_config(), notify=lambda m: None, max_rounds=3)
+    assert "too many tool calls" in out.lower()

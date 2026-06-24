@@ -86,8 +86,15 @@ reply still works and voice output degrades quietly.
 
 ## Tests
 
-Pure, no-network unit tests cover the security-critical calculator, history
-trimming, and the RAG chunking/retrieval math:
+No network or API keys required. Coverage:
+
+- **Unit** — the security-critical calculator, history trimming, web-search
+  failure handling, voice (PCM→WAV, STT/TTS via a fake client), and the RAG
+  chunking / retrieval / cache logic.
+- **Integration** — the full agent loop (model → tool → feed-back → answer) and
+  its safety cap, driven by a scripted fake client.
+- **Render smoke** — both Streamlit apps are rendered with Streamlit's `AppTest`
+  and asserted to load without exceptions, with the voice widgets present.
 
 ```bash
 pip install -r requirements.txt
