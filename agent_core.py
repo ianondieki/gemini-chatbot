@@ -17,7 +17,9 @@ callback.
 """
 
 import os
+import io
 import ast
+import wave
 import time
 import operator
 
@@ -32,6 +34,11 @@ FALLBACK_MODEL = "gemini-2.5-flash-lite"  # tried if the main model is overloade
 MAX_RETRIES = 4                            # attempts per model on transient errors
 MAX_HISTORY = 20                           # cap conversation turns kept in memory
 MAX_TOOL_ROUNDS = 6                        # safety cap: stop the agent looping forever
+
+# Voice (Gemini-native: same client/key, no extra dependencies)
+TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
+TTS_VOICE = os.getenv("GEMINI_VOICE", "Kore")  # any Gemini prebuilt voice name
+TTS_SAMPLE_RATE = 24000  # Gemini TTS returns 24 kHz, 16-bit, mono PCM
 
 DEFAULT_SYSTEM_PROMPT = """You are a helpful, friendly AI assistant with two tools:
 - web_search: use it for recent news, current events, live prices, or anything
@@ -284,3 +291,61 @@ def run_agent(client, tavily, history, config, notify=None,
                 )
             )
         history.append(types.Content(role="user", parts=tool_result_parts))
+
+
+# ─────────────────────────────────────────
+# VOICE (Gemini-native speech-to-text and text-to-speech)
+# ─────────────────────────────────────────
+def pcm_to_wav(pcm: bytes, sample_rate: int = TTS_SAMPLE_RATE,
+               channels: int = 1, sample_width: int = 2) -> bytes:
+    """Wrap raw little-endian PCM samples in a WAV container so a browser can
+    play them. Pure / stdlib-only — Gemini TTS hands back headerless PCM."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(sample_width)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm)
+    return buf.getvalue()
+
+
+def transcribe_audio(client, audio_bytes: bytes, mime_type: str = "audio/wav",
+                     model: str = MODEL) -> str:
+    """Speech-to-text via Gemini's audio understanding. Returns the transcript
+    (stripped); raises on API error so the caller can report it like any other
+    model call."""
+    response = client.models.generate_content(
+        model=model,
+        contents=[
+            "Transcribe this audio to text verbatim. Return ONLY the words "
+            "spoken, with no commentary, labels, or punctuation you did not hear.",
+            types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+        ],
+    )
+    return (response.text or "").strip()
+
+
+def synthesize_speech(client, text: str, voice: str = TTS_VOICE,
+                      model: str = TTS_MODEL):
+    """Text-to-speech via Gemini. Returns WAV bytes, or None if synthesis is
+    unavailable (e.g. the TTS model isn't enabled for this key) — voice output
+    is a nicety, so a failure must never break the text reply."""
+    try:
+        response = client.models.generate_content(
+            model=model,
+            contents=text,
+            config=types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name=voice
+                        )
+                    )
+                ),
+            ),
+        )
+        pcm = response.candidates[0].content.parts[0].inline_data.data
+        return pcm_to_wav(pcm) if pcm else None
+    except Exception:
+        return None

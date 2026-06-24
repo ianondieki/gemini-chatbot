@@ -10,6 +10,7 @@ Run:  streamlit run app.py
 """
 
 import os
+import hashlib
 
 import streamlit as st
 from google import genai
@@ -193,6 +194,8 @@ if "history" not in st.session_state:
     st.session_state.history = []
 if "display" not in st.session_state:
     st.session_state.display = []
+if "last_audio_id" not in st.session_state:
+    st.session_state.last_audio_id = None  # dedupe: a recording fires only once
 
 # Ability cards in the main area (replaces the sidebar; always visible on mobile)
 st.markdown(
@@ -211,27 +214,39 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Centered Clear button under the cards.
-_left, _mid, _right = st.columns([1, 2, 1])
-with _mid:
+# Controls under the cards: voice-reply toggle + clear.
+_left, _right = st.columns([1, 1])
+with _left:
+    st.toggle("🔊 Voice replies", key="voice_on",
+              help="Speak Angel's answers aloud (Gemini text-to-speech).")
+with _right:
     if st.button("Clear conversation", use_container_width=True, key="clear_main"):
         st.session_state.history = []
         st.session_state.display = []
+        st.session_state.last_audio_id = None
         st.rerun()
 
-# CHAT
-if not st.session_state.display:
-    st.markdown(
-        "<p style='text-align:center;color:#6b6a85;font-size:1.05rem;'>"
-        "Ask me about today's news, a tricky calculation, or anything at all.</p>",
-        unsafe_allow_html=True,
-    )
+# Microphone: record a question instead of typing it.
+audio_in = st.audio_input("🎙️ Or speak to Angel", key="mic")
 
-for msg in st.session_state.display:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["text"])
 
-if prompt := st.chat_input("Message Angel..."):
+def _maybe_speak(answer: str) -> None:
+    """If voice replies are on, synthesize and autoplay Angel's answer. Never
+    let a TTS failure disrupt the (already shown) text reply."""
+    if not st.session_state.get("voice_on"):
+        return
+    if answer.startswith(("API error", "Error", "Stopped:")):
+        return
+    with st.spinner("Generating voice..."):
+        wav = core.synthesize_speech(client, answer)
+    if wav:
+        st.audio(wav, format="audio/wav", autoplay=True)
+    else:
+        st.caption("🔇 Voice reply unavailable right now.")
+
+
+def handle_prompt(prompt: str) -> None:
+    """Run one full agent turn for a user prompt (typed or transcribed)."""
     st.session_state.display.append({"role": "user", "text": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
@@ -256,5 +271,46 @@ if prompt := st.chat_input("Message Angel..."):
                 answer = f"Error: {e}"
                 status.update(label="Error", state="error")
         st.markdown(answer)
+        _maybe_speak(answer)
 
     st.session_state.display.append({"role": "assistant", "text": answer})
+
+# CHAT
+if not st.session_state.display:
+    st.markdown(
+        "<p style='text-align:center;color:#6b6a85;font-size:1.05rem;'>"
+        "Ask me about today's news, a tricky calculation, or anything at all.</p>",
+        unsafe_allow_html=True,
+    )
+
+for msg in st.session_state.display:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["text"])
+
+# Resolve this turn's prompt from either the text box or the microphone.
+# Typed text wins; a new recording is transcribed once (deduped by content hash)
+# so reruns don't replay the same audio.
+typed = st.chat_input("Message Angel...")
+prompt = typed
+
+if not typed and audio_in is not None:
+    audio_bytes = audio_in.getvalue()
+    audio_id = hashlib.sha256(audio_bytes).hexdigest()
+    if audio_id != st.session_state.last_audio_id:
+        st.session_state.last_audio_id = audio_id
+        with st.spinner("Transcribing your voice..."):
+            try:
+                spoken = core.transcribe_audio(
+                    client, audio_bytes,
+                    mime_type=getattr(audio_in, "type", None) or "audio/wav",
+                )
+            except Exception as e:
+                spoken = ""
+                st.warning(f"Could not transcribe the recording: {e}")
+        if spoken:
+            prompt = spoken
+        else:
+            st.info("I couldn't make out any words in that recording — try again.")
+
+if prompt:
+    handle_prompt(prompt)

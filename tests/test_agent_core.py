@@ -10,8 +10,14 @@ import math
 
 import pytest
 
+import io
+import wave
+
 import agent_core as core
-from agent_core import do_calculate, do_search, is_search_error, trim_history
+from agent_core import (
+    do_calculate, do_search, is_search_error, trim_history,
+    pcm_to_wav, transcribe_audio, synthesize_speech,
+)
 from google.genai import types
 
 
@@ -235,3 +241,72 @@ def test_corrupt_cache_is_treated_as_miss(tmp_path):
     (cache_dir / f"{key}.chunks.json").write_text("{not valid json")
     (cache_dir / f"{key}.emb.npy").write_bytes(b"garbage")
     assert rag.load_cache("x.pdf-1", cache_dir=str(cache_dir)) is None
+
+
+# ─────────────────────────────────────────
+# Voice: PCM->WAV wrapping, and STT/TTS against a fake Gemini client
+# ─────────────────────────────────────────
+from types import SimpleNamespace as _NS
+
+
+class _FakeModels:
+    def __init__(self, response=None, exc=None, capture=None):
+        self._response, self._exc, self._capture = response, exc, capture
+
+    def generate_content(self, **kwargs):
+        if self._capture is not None:
+            self._capture.update(kwargs)
+        if self._exc:
+            raise self._exc
+        return self._response
+
+
+class _FakeClient:
+    def __init__(self, response=None, exc=None, capture=None):
+        self.models = _FakeModels(response, exc, capture)
+
+
+def test_pcm_to_wav_roundtrips_frames():
+    pcm = bytes(range(256)) * 4  # arbitrary even-length PCM payload
+    wav = pcm_to_wav(pcm, sample_rate=24000)
+    with wave.open(io.BytesIO(wav)) as wf:
+        assert wf.getframerate() == 24000
+        assert wf.getnchannels() == 1
+        assert wf.getsampwidth() == 2
+        assert wf.readframes(wf.getnframes()) == pcm
+
+
+def test_transcribe_audio_returns_stripped_text():
+    capture = {}
+    client = _FakeClient(response=_NS(text="  hello there  "), capture=capture)
+    out = transcribe_audio(client, b"\x00\x01\x02", mime_type="audio/wav")
+    assert out == "hello there"
+    # the audio bytes must actually be sent to the model as a Part
+    assert capture["model"] == core.MODEL
+    assert len(capture["contents"]) == 2
+
+
+def test_transcribe_audio_handles_empty_text():
+    client = _FakeClient(response=_NS(text=None))
+    assert transcribe_audio(client, b"\x00") == ""
+
+
+def test_synthesize_speech_wraps_pcm_in_wav():
+    pcm = b"\x10\x20" * 50
+    resp = _NS(candidates=[_NS(content=_NS(parts=[_NS(inline_data=_NS(data=pcm))]))])
+    client = _FakeClient(response=resp)
+    wav = synthesize_speech(client, "say hi")
+    assert wav is not None
+    with wave.open(io.BytesIO(wav)) as wf:
+        assert wf.readframes(wf.getnframes()) == pcm
+
+
+def test_synthesize_speech_returns_none_on_failure():
+    # A TTS outage / model-not-enabled must degrade gracefully, never raise.
+    client = _FakeClient(exc=RuntimeError("tts model not enabled"))
+    assert synthesize_speech(client, "say hi") is None
+
+
+def test_synthesize_speech_returns_none_on_empty_audio():
+    resp = _NS(candidates=[_NS(content=_NS(parts=[_NS(inline_data=_NS(data=b""))]))])
+    assert synthesize_speech(_FakeClient(response=resp), "x") is None

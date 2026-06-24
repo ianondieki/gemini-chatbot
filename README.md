@@ -68,6 +68,20 @@ in `agent_core.py`, so the CLI and the web UI stay in lock-step.
 `chatbot.py` and `app.py` need both `GEMINI_API_KEY` and `TAVILY_API_KEY`.
 `rag_app.py` only needs `GEMINI_API_KEY`.
 
+## Voice (Angel web UI)
+
+`app.py` has an optional voice layer, built entirely on Gemini — no extra
+dependencies or keys:
+
+- **Speak instead of type** — the 🎙️ recorder transcribes your question with
+  Gemini's audio understanding, then runs it through the normal agent.
+- **Hear the reply** — toggle **🔊 Voice replies** to have Angel's answers
+  spoken back via Gemini text-to-speech.
+
+The voice and model are configurable in `.env` (`GEMINI_VOICE`,
+`GEMINI_TTS_MODEL`). If the TTS model isn't enabled for your key, the text
+reply still works and voice output degrades quietly.
+
 ## Tests
 
 Pure, no-network unit tests cover the security-critical calculator, history
