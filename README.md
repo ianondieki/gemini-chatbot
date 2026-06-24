@@ -53,6 +53,31 @@ No spaces around `=`, no quotes, and the file must be named exactly `.env`.
 python chatbot.py
 ```
 
+## Other front-ends
+
+The same agent powers three interfaces. The shared logic — tool definitions,
+the safe calculator, web search, retry/fallback, and the agentic loop — lives
+in `agent_core.py`, so the CLI and the web UI stay in lock-step.
+
+| File | What it is | Run |
+| ---- | ---------- | --- |
+| `chatbot.py` | Terminal chatbot (Gemini + search + calculator) | `python chatbot.py` |
+| `app.py` | "Angel" — the same agent with a Streamlit web UI | `streamlit run app.py` |
+| `rag_app.py` | "Chat with your PDF" — a standalone RAG demo | `streamlit run rag_app.py` |
+
+`chatbot.py` and `app.py` need both `GEMINI_API_KEY` and `TAVILY_API_KEY`.
+`rag_app.py` only needs `GEMINI_API_KEY`.
+
+## Tests
+
+Pure, no-network unit tests cover the security-critical calculator, history
+trimming, and the RAG chunking/retrieval math:
+
+```bash
+pip install -r requirements.txt
+pytest
+```
+
 ## Commands (inside the chat)
 
 | Command          | Action                       |

@@ -136,113 +136,121 @@ def answer_question(client, question, chunks, embeddings):
 
 
 # UI
-st.set_page_config(page_title="Chat with your PDF", page_icon="P", layout="centered")
-st.title("Chat with your PDF")
-st.caption(f"RAG demo - embeddings: {EMBED_MODEL} - answers: {CHAT_MODEL}")
+# Wrapped in main() so the pure functions above (chunk_text, top_k_chunks, ...)
+# can be imported by tests without executing any Streamlit code. `streamlit run
+# rag_app.py` runs this file as __main__, so the app still launches normally.
+def main():
+    st.set_page_config(page_title="Chat with your PDF", page_icon="P", layout="centered")
+    st.title("Chat with your PDF")
+    st.caption(f"RAG demo - embeddings: {EMBED_MODEL} - answers: {CHAT_MODEL}")
 
-if not os.getenv("GEMINI_API_KEY"):
-    st.error("GEMINI_API_KEY not found in .env")
-    st.stop()
+    if not os.getenv("GEMINI_API_KEY"):
+        st.error("GEMINI_API_KEY not found in .env")
+        st.stop()
 
-client = get_client()
+    client = get_client()
 
-for key in ("rag_chunks", "rag_emb", "rag_file", "rag_msgs"):
-    if key not in st.session_state:
-        st.session_state[key] = None if key != "rag_msgs" else []
+    for key in ("rag_chunks", "rag_emb", "rag_file", "rag_msgs"):
+        if key not in st.session_state:
+            st.session_state[key] = None if key != "rag_msgs" else []
 
-uploaded = st.file_uploader("Upload a PDF", type="pdf")
+    uploaded = st.file_uploader("Upload a PDF", type="pdf")
 
-if uploaded is not None:
-    file_id = f"{uploaded.name}-{uploaded.size}"
-    if st.session_state.rag_file != file_id:
-        with st.status("Indexing your PDF...", expanded=True) as status:
-            status.write("Reading text from the PDF...")
-            reader = PdfReader(uploaded)
-            raw = "\n".join((page.extract_text() or "") for page in reader.pages)
+    if uploaded is not None:
+        file_id = f"{uploaded.name}-{uploaded.size}"
+        if st.session_state.rag_file != file_id:
+            with st.status("Indexing your PDF...", expanded=True) as status:
+                status.write("Reading text from the PDF...")
+                reader = PdfReader(uploaded)
+                raw = "\n".join((page.extract_text() or "") for page in reader.pages)
 
-            if not raw.strip():
-                status.update(label="No selectable text found", state="error")
-                st.warning(
-                    "This PDF has no extractable text (it may be scanned images). "
-                    "Try a text-based PDF."
-                )
-                st.stop()
+                if not raw.strip():
+                    status.update(label="No selectable text found", state="error")
+                    st.warning(
+                        "This PDF has no extractable text (it may be scanned images). "
+                        "Try a text-based PDF."
+                    )
+                    st.stop()
 
-            status.write("Splitting into chunks...")
-            chunks = chunk_text(raw)
+                status.write("Splitting into chunks...")
+                chunks = chunk_text(raw)
 
-            # Cap very large documents so indexing stays within free-tier limits.
-            capped = False
-            if len(chunks) > MAX_CHUNKS:
-                capped = True
-                chunks = chunks[:MAX_CHUNKS]
+                # Cap very large documents so indexing stays within free-tier limits.
+                capped = False
+                if len(chunks) > MAX_CHUNKS:
+                    capped = True
+                    chunks = chunks[:MAX_CHUNKS]
 
-            status.write(f"Embedding {len(chunks)} chunks (this can take a while)...")
-            bar = st.progress(0.0)
+                status.write(f"Embedding {len(chunks)} chunks (this can take a while)...")
+                bar = st.progress(0.0)
 
-            def _update(done, total):
-                bar.progress(done / total, text=f"Embedded {done}/{total} chunks")
+                def _update(done, total):
+                    bar.progress(done / total, text=f"Embedded {done}/{total} chunks")
 
-            try:
-                embeddings = embed_texts(
-                    client, chunks, task_type="RETRIEVAL_DOCUMENT", progress=_update
-                )
-            except genai_errors.APIError as e:
-                status.update(label="Embedding failed", state="error")
-                st.error(
-                    f"Embedding error after retries: {e}\n\n"
-                    "This usually means the free-tier rate limit was hit. "
-                    "Try a smaller PDF, or wait a minute and re-upload."
-                )
-                st.stop()
-
-            st.session_state.rag_chunks = chunks
-            st.session_state.rag_emb = embeddings
-            st.session_state.rag_file = file_id
-            st.session_state.rag_msgs = []
-
-            label = f"Indexed {len(chunks)} chunks from {uploaded.name}"
-            if capped:
-                label += f" (capped at {MAX_CHUNKS}; later pages not indexed)"
-            status.update(label=label, state="complete", expanded=False)
-
-        if capped:
-            st.warning(
-                f"This PDF was large, so only the first {MAX_CHUNKS} chunks were "
-                "indexed. Questions about later pages may not be answerable. For a "
-                "full book, a vector database (e.g. ChromaDB) is the next step."
-            )
-
-if st.session_state.rag_chunks is not None:
-    for m in st.session_state.rag_msgs:
-        with st.chat_message(m["role"]):
-            st.markdown(m["text"])
-
-    if q := st.chat_input("Ask a question about the document..."):
-        st.session_state.rag_msgs.append({"role": "user", "text": q})
-        with st.chat_message("user"):
-            st.markdown(q)
-
-        with st.chat_message("assistant"):
-            with st.spinner("Searching the document..."):
                 try:
-                    answer, idx, scores = answer_question(
-                        client, q,
-                        st.session_state.rag_chunks,
-                        st.session_state.rag_emb,
+                    embeddings = embed_texts(
+                        client, chunks, task_type="RETRIEVAL_DOCUMENT", progress=_update
                     )
                 except genai_errors.APIError as e:
-                    answer, idx, scores = f"API error: {e}", [], []
+                    status.update(label="Embedding failed", state="error")
+                    st.error(
+                        f"Embedding error after retries: {e}\n\n"
+                        "This usually means the free-tier rate limit was hit. "
+                        "Try a smaller PDF, or wait a minute and re-upload."
+                    )
+                    st.stop()
 
-            st.markdown(answer)
+                st.session_state.rag_chunks = chunks
+                st.session_state.rag_emb = embeddings
+                st.session_state.rag_file = file_id
+                st.session_state.rag_msgs = []
 
-            if len(idx) > 0:
-                with st.expander("Sources used (retrieved chunks)"):
-                    for i, s in zip(idx, scores):
-                        st.markdown(f"**Chunk {int(i)}** - similarity {s:.3f}")
-                        snippet = st.session_state.rag_chunks[int(i)]
-                        st.caption(snippet[:400] + ("..." if len(snippet) > 400 else ""))
+                label = f"Indexed {len(chunks)} chunks from {uploaded.name}"
+                if capped:
+                    label += f" (capped at {MAX_CHUNKS}; later pages not indexed)"
+                status.update(label=label, state="complete", expanded=False)
 
-        st.session_state.rag_msgs.append({"role": "assistant", "text": answer})
-else:
-    st.info("Upload a PDF above to get started.")
+            if capped:
+                st.warning(
+                    f"This PDF was large, so only the first {MAX_CHUNKS} chunks were "
+                    "indexed. Questions about later pages may not be answerable. For a "
+                    "full book, a vector database (e.g. ChromaDB) is the next step."
+                )
+
+    if st.session_state.rag_chunks is not None:
+        for m in st.session_state.rag_msgs:
+            with st.chat_message(m["role"]):
+                st.markdown(m["text"])
+
+        if q := st.chat_input("Ask a question about the document..."):
+            st.session_state.rag_msgs.append({"role": "user", "text": q})
+            with st.chat_message("user"):
+                st.markdown(q)
+
+            with st.chat_message("assistant"):
+                with st.spinner("Searching the document..."):
+                    try:
+                        answer, idx, scores = answer_question(
+                            client, q,
+                            st.session_state.rag_chunks,
+                            st.session_state.rag_emb,
+                        )
+                    except genai_errors.APIError as e:
+                        answer, idx, scores = f"API error: {e}", [], []
+
+                st.markdown(answer)
+
+                if len(idx) > 0:
+                    with st.expander("Sources used (retrieved chunks)"):
+                        for i, s in zip(idx, scores):
+                            st.markdown(f"**Chunk {int(i)}** - similarity {s:.3f}")
+                            snippet = st.session_state.rag_chunks[int(i)]
+                            st.caption(snippet[:400] + ("..." if len(snippet) > 400 else ""))
+
+            st.session_state.rag_msgs.append({"role": "assistant", "text": answer})
+    else:
+        st.info("Upload a PDF above to get started.")
+
+
+if __name__ == "__main__":
+    main()
