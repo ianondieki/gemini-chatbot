@@ -76,11 +76,18 @@ st.markdown(
         font-family: 'Cormorant Garamond', serif;
         font-weight: 700; font-size: 4.4rem; line-height: 1;
         letter-spacing: 0.5px; margin: 0.2rem 0 0.1rem;
-        background: linear-gradient(100deg, #8a6cff 0%, #c86dd7 45%, #ff9bc7 100%);
-        -webkit-background-clip: text; background-clip: text;
-        -webkit-text-fill-color: transparent;
+        color: #a06bff;  /* fallback if background-clip:text is unsupported */
         text-shadow: 0 6px 30px rgba(200,150,255,0.25);
         animation: rise 0.9s cubic-bezier(.2,.8,.2,1) both;
+      }
+      /* Only make the text transparent where the gradient can actually be
+         clipped to it — otherwise the title would vanish (e.g. older Firefox). */
+      @supports ((-webkit-background-clip: text) or (background-clip: text)) {
+        .angel-title {
+          background: linear-gradient(100deg, #8a6cff 0%, #c86dd7 45%, #ff9bc7 100%);
+          -webkit-background-clip: text; background-clip: text;
+          -webkit-text-fill-color: transparent;
+        }
       }
       .angel-tag {
         font-family: 'Outfit', sans-serif; font-weight: 300; font-size: 1.02rem;
