@@ -53,6 +53,54 @@ No spaces around `=`, no quotes, and the file must be named exactly `.env`.
 python chatbot.py
 ```
 
+## Other front-ends
+
+The same agent powers three interfaces. The shared logic — tool definitions,
+the safe calculator, web search, retry/fallback, and the agentic loop — lives
+in `agent_core.py`, so the CLI and the web UI stay in lock-step.
+
+| File | What it is | Run |
+| ---- | ---------- | --- |
+| `chatbot.py` | Terminal chatbot (Gemini + search + calculator) | `python chatbot.py` |
+| `app.py` | "Angel" — the same agent with a Streamlit web UI | `streamlit run app.py` |
+| `rag_app.py` | "Chat with your PDF" — a standalone RAG demo | `streamlit run rag_app.py` |
+
+`chatbot.py` and `app.py` need both `GEMINI_API_KEY` and `TAVILY_API_KEY`.
+`rag_app.py` only needs `GEMINI_API_KEY`.
+
+## Voice (web UIs)
+
+Both Streamlit apps — `app.py` ("Angel") and `rag_app.py` ("Chat with your
+PDF") — have an optional voice layer, built entirely on Gemini, with no extra
+dependencies or keys:
+
+- **Speak instead of type** — the 🎙️ recorder transcribes your question with
+  Gemini's audio understanding, then runs it through the normal flow (the agent
+  in Angel, the document search in the RAG app).
+- **Hear the reply** — toggle **🔊 Voice replies** to have answers spoken back
+  via Gemini text-to-speech.
+
+The voice and model are configurable in `.env` (`GEMINI_VOICE`,
+`GEMINI_TTS_MODEL`). If the TTS model isn't enabled for your key, the text
+reply still works and voice output degrades quietly.
+
+## Tests
+
+No network or API keys required. Coverage:
+
+- **Unit** — the security-critical calculator, history trimming, web-search
+  failure handling, voice (PCM→WAV, STT/TTS via a fake client), and the RAG
+  chunking / retrieval / cache logic.
+- **Integration** — the full agent loop (model → tool → feed-back → answer) and
+  its safety cap, driven by a scripted fake client.
+- **Render smoke** — both Streamlit apps are rendered with Streamlit's `AppTest`
+  and asserted to load without exceptions, with the voice widgets present.
+
+```bash
+pip install -r requirements.txt
+pytest
+```
+
 ## Commands (inside the chat)
 
 | Command          | Action                       |
