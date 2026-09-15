@@ -319,7 +319,10 @@ def render_trace(events) -> None:
                 st.markdown(f"- {step}")
         elif event.kind == "tool_started":
             arguments = ", ".join(f"{k}={v}" for k, v in event.args.items())
-            st.markdown(f"**{event.name}** `{str(arguments)[:200]}`")
+            st.markdown(
+                f"**{event.name}** `{arguments[:200]}`" if arguments
+                else f"**{event.name}**"
+            )
         elif event.kind == "tool_finished" and not event.ok:
             st.markdown(f":red[failed] {event.preview}")
         elif event.kind == "reflection":
@@ -365,6 +368,12 @@ if prompt := st.chat_input("Message Angel..."):
                 expanded=False,
             )
         st.markdown(result.answer)
+
+        # Render the trace for this turn too, not just for past ones - otherwise
+        # the message you just sent is the only one you cannot inspect.
+        if recorder.events:
+            with st.expander("How Angel worked this out"):
+                render_trace(recorder.events)
 
     st.session_state.messages.append(
         {"role": "assistant", "text": result.answer, "events": recorder.events}
