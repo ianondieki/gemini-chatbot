@@ -209,7 +209,8 @@ class StatusRenderer:
 
         elif event.kind == "tool_started":
             arguments = ", ".join(f"{k}={_shorten(v, 80)}" for k, v in event.args.items())
-            write(f"**{event.name}** &nbsp; `{arguments}`")
+            # A no-argument tool would otherwise render an empty code span.
+            write(f"**{event.name}** &nbsp; `{arguments}`" if arguments else f"**{event.name}**")
 
         elif event.kind == "tool_finished":
             if not event.ok:
