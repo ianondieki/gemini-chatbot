@@ -24,6 +24,7 @@ from .rag import DocumentLibrary, Embedder
 from .registry import ToolRegistry
 from .tools import build_registry
 from .tools.search import make_search_client
+from . import voice
 
 
 class AgentSession:
@@ -128,11 +129,17 @@ class AgentSession:
         """Run one user turn."""
         return self.agent.run(message, sink=sink)
 
-    def load_pdf(self, source: Any, name: str, progress=None) -> int:
-        """Index a PDF and switch the retrieval tools on."""
+    def load_pdf(
+        self, source: Any, name: str, progress=None, file_id: Optional[str] = None
+    ) -> int:
+        """Index a PDF and switch the retrieval tools on.
+
+        ``file_id`` enables the embedding cache, so re-uploading the same file
+        skips the slow part entirely.
+        """
         if self.documents is None:
             raise ConfigError("this session was created without document support")
-        added = self.documents.add_pdf(source, name, progress)
+        added = self.documents.add_pdf(source, name, progress, file_id=file_id)
         self._rebuild()
         return added
 
@@ -169,6 +176,17 @@ class AgentSession:
             self.documents.embedder.config = self.config
         self._rebuild()
         return self.config
+
+    # --- voice ---------------------------------------------------------
+    def transcribe(self, audio: bytes, mime_type: str = "audio/wav") -> str:
+        """Turn spoken audio into text. Raises if the model call fails."""
+        return voice.transcribe(self.llm.client, audio, self.config, mime_type)
+
+    def speak(self, text: str) -> Optional[bytes]:
+        """Render an answer as WAV audio, or ``None`` if TTS is unavailable."""
+        if voice.is_error_answer(text):
+            return None
+        return voice.synthesize(self.llm.client, text, self.config)
 
     # ------------------------------------------------------------------
     @property

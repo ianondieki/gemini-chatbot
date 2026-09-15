@@ -113,6 +113,16 @@ class AgentConfig:
     embed_retries: int = 5
     max_chunks: int = 1200
 
+    # Re-uploading the same PDF should not re-pay the embedding cost.
+    cache_enabled: bool = True
+    cache_dir: str = ".rag_cache"
+
+    # --- voice ---------------------------------------------------------
+    stt_model: str = ""            # blank falls back to `model`
+    tts_model: str = "gemini-2.5-flash-preview-tts"
+    tts_voice: str = "Kore"        # any Gemini prebuilt voice name
+    tts_sample_rate: int = 24_000  # Gemini TTS returns 24 kHz 16-bit mono
+
     def __post_init__(self) -> None:
         if self.planning not in _PLANNING_MODES:
             raise ConfigError(
@@ -177,6 +187,11 @@ class AgentConfig:
             embed_model=_env_str("GEMINI_EMBED_MODEL", cls.embed_model),
             retrieval_top_k=_env_int("RAG_TOP_K", cls.retrieval_top_k),
             max_chunks=_env_int("RAG_MAX_CHUNKS", cls.max_chunks),
+            cache_enabled=_env_bool("RAG_CACHE", cls.cache_enabled),
+            cache_dir=_env_str("RAG_CACHE_DIR", cls.cache_dir),
+            stt_model=_env_str("GEMINI_STT_MODEL", cls.stt_model),
+            tts_model=_env_str("GEMINI_TTS_MODEL", cls.tts_model),
+            tts_voice=_env_str("GEMINI_VOICE", cls.tts_voice),
         )
 
     def for_delegate(self) -> "AgentConfig":

@@ -14,6 +14,7 @@ Run:  streamlit run app.py
 
 from __future__ import annotations
 
+import hashlib
 import os
 
 import streamlit as st
@@ -70,11 +71,18 @@ st.markdown(
         font-family: 'Cormorant Garamond', serif;
         font-weight: 700; font-size: 4.4rem; line-height: 1;
         letter-spacing: 0.5px; margin: 0.2rem 0 0.1rem;
-        background: linear-gradient(100deg, #8a6cff 0%, #c86dd7 45%, #ff9bc7 100%);
-        -webkit-background-clip: text; background-clip: text;
-        -webkit-text-fill-color: transparent;
+        color: #a06bff;  /* fallback where background-clip:text is unsupported */
         text-shadow: 0 6px 30px rgba(200,150,255,0.25);
         animation: rise 0.9s cubic-bezier(.2,.8,.2,1) both;
+      }
+      /* Only go transparent where the gradient can actually be clipped to the
+         text - otherwise the title disappears entirely (older Firefox). */
+      @supports ((-webkit-background-clip: text) or (background-clip: text)) {
+        .angel-title {
+          background: linear-gradient(100deg, #8a6cff 0%, #c86dd7 45%, #ff9bc7 100%);
+          -webkit-background-clip: text; background-clip: text;
+          -webkit-text-fill-color: transparent;
+        }
       }
       .angel-tag {
         font-family: 'Outfit', sans-serif; font-weight: 300; font-size: 1.02rem;
@@ -199,6 +207,8 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "indexed" not in st.session_state:
     st.session_state.indexed = None
+if "last_audio" not in st.session_state:
+    st.session_state.last_audio = None   # dedupe: a recording runs once, not per rerun
 
 
 # --------------------------------------------------------------------------
@@ -250,7 +260,9 @@ with st.expander("Document and settings", expanded=False):
                     bar.progress(done / total, text=f"Embedded {done}/{total} chunks")
 
                 try:
-                    added = session.load_pdf(uploaded, uploaded.name, progress)
+                    added = session.load_pdf(
+                        uploaded, uploaded.name, progress, file_id=file_id
+                    )
                 except Exception as exc:
                     status.update(label="Indexing failed", state="error")
                     st.error(
@@ -260,10 +272,12 @@ with st.expander("Document and settings", expanded=False):
                     )
                 else:
                     st.session_state.indexed = file_id
-                    status.update(
-                        label=f"Indexed {added} chunks from {uploaded.name}",
-                        state="complete", expanded=False,
+                    label = (
+                        f"Loaded {added} cached chunks from {uploaded.name}"
+                        if session.documents.cache_hit
+                        else f"Indexed {added} chunks from {uploaded.name}"
                     )
+                    status.update(label=label, state="complete", expanded=False)
 
     if session.documents is not None and not session.documents.is_empty:
         st.caption(f"Loaded: {session.documents.describe()}")
@@ -298,12 +312,22 @@ with st.expander("Document and settings", expanded=False):
         f"Model {session.config.model} - tools: {', '.join(session.tool_names)}"
     )
 
-_left, _mid, _right = st.columns([1, 2, 1])
-with _mid:
+_voice, _clear = st.columns([1, 1])
+with _voice:
+    st.toggle(
+        "Voice replies",
+        key="voice_on",
+        help="Speak Angel's answers aloud, using Gemini text-to-speech.",
+    )
+with _clear:
     if st.button("Clear conversation", use_container_width=True):
         session.clear()
         st.session_state.messages = []
+        st.session_state.last_audio = None
         st.rerun()
+
+# Microphone: ask by speaking instead of typing.
+recording = st.audio_input("Or speak to Angel")
 
 
 # --------------------------------------------------------------------------
@@ -352,7 +376,44 @@ for message in st.session_state.messages:
             with st.expander("How Angel worked this out"):
                 render_trace(message["events"])
 
-if prompt := st.chat_input("Message Angel..."):
+def speak(answer: str) -> None:
+    """Play an answer aloud when voice replies are on.
+
+    Synthesis failing is a downgrade, not an error - the text answer is
+    already on screen, so this only ever adds a quiet caption.
+    """
+    if not st.session_state.get("voice_on"):
+        return
+    with st.spinner("Generating voice..."):
+        audio = session.speak(answer)
+    if audio:
+        st.audio(audio, format="audio/wav", autoplay=True)
+    else:
+        st.caption("Voice reply unavailable right now.")
+
+
+# This turn's prompt comes from the text box or the microphone. Typed text
+# wins; a recording is transcribed once, keyed by content hash, so Streamlit's
+# reruns do not replay the same audio over and over.
+prompt = st.chat_input("Message Angel...")
+
+if not prompt and recording is not None:
+    audio_bytes = recording.getvalue()
+    fingerprint = hashlib.sha256(audio_bytes).hexdigest()
+    if fingerprint != st.session_state.last_audio:
+        st.session_state.last_audio = fingerprint
+        with st.spinner("Transcribing..."):
+            try:
+                prompt = session.transcribe(
+                    audio_bytes,
+                    mime_type=getattr(recording, "type", None) or "audio/wav",
+                )
+            except Exception as exc:
+                st.warning(f"Could not transcribe that recording: {exc}")
+        if not prompt:
+            st.info("I could not make out any words in that recording.")
+
+if prompt:
     st.session_state.messages.append({"role": "user", "text": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
@@ -374,6 +435,8 @@ if prompt := st.chat_input("Message Angel..."):
         if recorder.events:
             with st.expander("How Angel worked this out"):
                 render_trace(recorder.events)
+
+        speak(result.answer)
 
     st.session_state.messages.append(
         {"role": "assistant", "text": result.answer, "events": recorder.events}

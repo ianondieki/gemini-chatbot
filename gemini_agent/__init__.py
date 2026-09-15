@@ -27,6 +27,7 @@ from .registry import ToolRegistry, ToolResult, ToolSpec
 from .render import ConsoleRenderer
 from .session import AgentSession
 from .tools import build_registry
+from . import voice
 
 __version__ = "2.0.0"
 
@@ -60,4 +61,5 @@ __all__ = [
     "build_system_prompt",
     "fan_out",
     "null_sink",
+    "voice",
 ]

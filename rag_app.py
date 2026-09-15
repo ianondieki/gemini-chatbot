@@ -20,6 +20,7 @@ Run:  streamlit run rag_app.py
 
 from __future__ import annotations
 
+import hashlib
 import os
 
 import streamlit as st
@@ -94,6 +95,8 @@ if "rag_messages" not in st.session_state:
     st.session_state.rag_messages = []
 if "rag_file" not in st.session_state:
     st.session_state.rag_file = None
+if "rag_last_audio" not in st.session_state:
+    st.session_state.rag_last_audio = None
 
 # ---------------------------------------------------------------- INDEXING
 uploaded = st.file_uploader("Upload a PDF", type="pdf")
@@ -110,7 +113,9 @@ if uploaded is not None:
 
             try:
                 session.unload_documents()
-                added = session.load_pdf(uploaded, uploaded.name, progress)
+                added = session.load_pdf(
+                    uploaded, uploaded.name, progress, file_id=file_id
+                )
             except Exception as exc:
                 status.update(label="Indexing failed", state="error")
                 st.error(
@@ -123,10 +128,12 @@ if uploaded is not None:
             st.session_state.rag_file = file_id
             st.session_state.rag_messages = []
             session.clear()
-            status.update(
-                label=f"Indexed {added} chunks from {uploaded.name}",
-                state="complete", expanded=False,
+            label = (
+                f"Loaded {added} cached chunks from {uploaded.name}"
+                if session.documents.cache_hit
+                else f"Indexed {added} chunks from {uploaded.name}"
             )
+            status.update(label=label, state="complete", expanded=False)
 
         if session.documents.index.truncated:
             st.warning(
@@ -143,6 +150,13 @@ if session.documents is None or session.documents.is_empty:
 
 st.caption(f"Loaded: {session.documents.describe()}")
 
+st.toggle(
+    "Voice replies",
+    key="rag_voice_on",
+    help="Read the answer aloud, using Gemini text-to-speech.",
+)
+recording = st.audio_input("Or ask your question out loud")
+
 for message in st.session_state.rag_messages:
     with st.chat_message(message["role"]):
         st.markdown(message["text"])
@@ -152,7 +166,26 @@ for message in st.session_state.rag_messages:
                     st.markdown(f"**{source['label']}**")
                     st.caption(source["text"])
 
-if question := st.chat_input("Ask a question about the document..."):
+# Typed question wins; a recording is transcribed once, keyed by content hash.
+question = st.chat_input("Ask a question about the document...")
+
+if not question and recording is not None:
+    audio_bytes = recording.getvalue()
+    fingerprint = hashlib.sha256(audio_bytes).hexdigest()
+    if fingerprint != st.session_state.rag_last_audio:
+        st.session_state.rag_last_audio = fingerprint
+        with st.spinner("Transcribing..."):
+            try:
+                question = session.transcribe(
+                    audio_bytes,
+                    mime_type=getattr(recording, "type", None) or "audio/wav",
+                )
+            except Exception as exc:
+                st.warning(f"Could not transcribe that recording: {exc}")
+        if not question:
+            st.info("I could not make out any words in that recording.")
+
+if question:
     st.session_state.rag_messages.append({"role": "user", "text": question})
     with st.chat_message("user"):
         st.markdown(question)
@@ -191,6 +224,14 @@ if question := st.chat_input("Ask a question about the document..."):
                 for source in sources:
                     st.markdown(f"**{source['label']}**")
                     st.caption(source["text"])
+
+        if st.session_state.get("rag_voice_on"):
+            with st.spinner("Generating voice..."):
+                audio = session.speak(result.answer)
+            if audio:
+                st.audio(audio, format="audio/wav", autoplay=True)
+            else:
+                st.caption("Voice reply unavailable right now.")
 
     st.session_state.rag_messages.append(
         {"role": "assistant", "text": result.answer, "sources": sources}

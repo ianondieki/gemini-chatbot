@@ -89,6 +89,17 @@ Plus, throughout:
 | `remember` / `recall` | The agent's own scratchpad. |
 | `delegate` | Spawns a focused sub-agent. |
 
+## Voice
+
+Both browser apps take a spoken question and can read the answer back, running
+on the same Gemini key — no extra service, no extra dependency. Transcription
+uses Gemini's audio understanding; replies use its TTS models.
+
+Speech-to-text raises on failure, because without a transcript there is no
+question. Text-to-speech fails quietly: the written answer is already on
+screen, so a missing voice reply is a downgrade rather than an error. Set
+`GEMINI_VOICE` to any Gemini prebuilt voice name.
+
 The toolbox is assembled from what is actually configured: no Tavily key means
 no web tools, and the system prompt is built from the live registry — so the
 agent is never told about a tool it does not have.
@@ -183,6 +194,8 @@ Everything is tunable from `.env`; see `.env.example` for the full list.
 | `AGENT_MAX_TOOL_CALLS` | `24` | tool executions per user turn |
 | `AGENT_MAX_REFLECTIONS` | `2` | how often the critic may reject a draft |
 | `AGENT_WALL_CLOCK_SECONDS` | `180` | hard time limit per user turn |
+| `GEMINI_VOICE` | `Kore` | which prebuilt voice reads answers aloud |
+| `RAG_CACHE` | `true` | cache embeddings so re-uploads are instant |
 
 ## Layout
 
@@ -202,9 +215,10 @@ gemini_agent/
   session.py          everything wired together
   prompts.py          system prompt built from the live registry
   config.py           one dataclass, read from the environment
+  voice.py            speech in and out, on the same Gemini client
   tools/              calculator, web, clock, notes, documents, delegation
-  rag/                chunking, embedding, vector store, PDF extraction
-tests/                223 tests, no API key and no network needed
+  rag/                chunking, embedding, vector store, PDF extraction, cache
+tests/                264 tests, no API key and no network needed
 ```
 
 ## Tests
@@ -227,6 +241,9 @@ pytest
 - The vector store is in-memory NumPy and resets when you quit. Past a few
   thousand chunks, swap `DocumentIndex` for a real vector database — the
   interface is deliberately the shape you would keep.
+- Embeddings are cached to `.rag_cache/`, keyed by the file *and* every setting
+  that would change the vectors, so re-uploading a PDF is instant but changing
+  the chunk size correctly re-embeds. `RAG_CACHE=false` turns it off.
 - `.env` holds secrets and is already in `.gitignore`. Keep it that way.
 - The agentic loop here is provider-agnostic in shape. Model → tool request →
   run tool → feed back → critique → repeat maps directly onto Claude's tool-use
