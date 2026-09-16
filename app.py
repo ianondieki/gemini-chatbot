@@ -10,9 +10,7 @@ Run:  streamlit run app.py
 """
 
 import os
-import ast
-import time
-import operator
+import hashlib
 
 import streamlit as st
 from google import genai
@@ -21,14 +19,11 @@ from google.genai import errors as genai_errors
 from tavily import TavilyClient
 from dotenv import load_dotenv
 
+import agent_core as core
+
 load_dotenv()
 
 # CONFIGURATION
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-FALLBACK_MODEL = "gemini-2.5-flash-lite"  # tried if the main model is overloaded
-MAX_RETRIES = 4                            # attempts per model on transient errors
-MAX_HISTORY = 20
-MAX_TOOL_ROUNDS = 6  # safety cap: stop the agent looping forever
 APP_NAME = "Angel"
 
 SYSTEM_PROMPT = """You are Angel, a helpful, friendly AI assistant with two tools:
@@ -38,182 +33,14 @@ SYSTEM_PROMPT = """You are Angel, a helpful, friendly AI assistant with two tool
 For general knowledge you already know well, just answer directly.
 Always be clear and concise."""
 
+# The agent itself (tools, calculator, search, retry/fallback, agentic loop)
+# lives in agent_core and is shared with the CLI front-end in chatbot.py.
+CONFIG = core.build_config(SYSTEM_PROMPT)
+
 
 @st.cache_resource
 def get_clients():
     return genai.Client(), TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
-
-
-# TOOL DEFINITIONS
-TOOLS = types.Tool(
-    function_declarations=[
-        types.FunctionDeclaration(
-            name="web_search",
-            description=(
-                "Search the web for current, real-time information: recent news, "
-                "current events, live prices, sports scores, weather, or anything "
-                "that may have changed after your training cutoff."
-            ),
-            parameters=types.Schema(
-                type=types.Type.OBJECT,
-                properties={
-                    "query": types.Schema(
-                        type=types.Type.STRING,
-                        description="The search query to look up",
-                    )
-                },
-                required=["query"],
-            ),
-        ),
-        types.FunctionDeclaration(
-            name="calculate",
-            description=(
-                "Evaluate a math expression and return the exact result. Use this "
-                "for any arithmetic. Supports + - * / ** % and parentheses."
-            ),
-            parameters=types.Schema(
-                type=types.Type.OBJECT,
-                properties={
-                    "expression": types.Schema(
-                        type=types.Type.STRING,
-                        description="A pure math expression, e.g. '2400 * 0.15'",
-                    )
-                },
-                required=["expression"],
-            ),
-        ),
-    ]
-)
-
-CONFIG = types.GenerateContentConfig(
-    system_instruction=SYSTEM_PROMPT,
-    tools=[TOOLS],
-    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-)
-
-
-# TOOL 1: WEB SEARCH
-def do_search(tavily, query: str) -> str:
-    try:
-        results = tavily.search(query=query, max_results=5, include_answer="basic")
-        parts = []
-        if results.get("answer"):
-            parts.append(f"Quick answer: {results['answer']}\n")
-        for r in results.get("results", []):
-            parts.append(
-                f"Title:   {r.get('title', '')}\n"
-                f"URL:     {r.get('url', '')}\n"
-                f"Summary: {r.get('content', '')}\n"
-            )
-        return "\n---\n".join(parts) if parts else "No results found."
-    except Exception as e:
-        return f"Search error: {e}"
-
-
-# TOOL 2: CALCULATOR (safe - no eval())
-_ALLOWED_OPS = {
-    ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
-    ast.Div: operator.truediv, ast.Pow: operator.pow, ast.Mod: operator.mod,
-    ast.FloorDiv: operator.floordiv, ast.USub: operator.neg, ast.UAdd: operator.pos,
-}
-
-
-def _safe_eval(node):
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-        return node.value
-    if isinstance(node, ast.BinOp) and type(node.op) in _ALLOWED_OPS:
-        return _ALLOWED_OPS[type(node.op)](_safe_eval(node.left), _safe_eval(node.right))
-    if isinstance(node, ast.UnaryOp) and type(node.op) in _ALLOWED_OPS:
-        return _ALLOWED_OPS[type(node.op)](_safe_eval(node.operand))
-    raise ValueError("Only basic arithmetic is allowed")
-
-
-def do_calculate(expression: str) -> str:
-    try:
-        tree = ast.parse(expression, mode="eval")
-        return f"{expression} = {_safe_eval(tree.body)}"
-    except Exception as e:
-        return f"Calculation error: could not evaluate '{expression}' ({e})"
-
-
-
-# RESILIENT MODEL CALL (handles 503 "overloaded" with retries + fallback)
-def generate_with_retry(client, history, status=None):
-    """
-    Call Gemini, retrying on transient errors (503/429/UNAVAILABLE).
-    Backs off a bit each try, and falls back to a lighter model if the
-    primary one stays overloaded. Raises the last error only if all fail.
-    """
-    models_to_try = [MODEL, FALLBACK_MODEL]
-    last_error = None
-
-    for model_name in models_to_try:
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                return client.models.generate_content(
-                    model=model_name, contents=history, config=CONFIG
-                )
-            except genai_errors.APIError as e:
-                msg = str(e)
-                transient = (
-                    "503" in msg or "UNAVAILABLE" in msg
-                    or "429" in msg or "overloaded" in msg.lower()
-                    or "high demand" in msg.lower()
-                )
-                if not transient:
-                    raise  # a real error (bad key, bad request) - don't retry
-                last_error = e
-                if attempt < MAX_RETRIES:
-                    wait = 2 ** (attempt - 1)  # 1s, 2s, 4s...
-                    note = f"Model busy, retrying in {wait}s (try {attempt}/{MAX_RETRIES})..."
-                    if status is not None:
-                        status.write(note)
-                    else:
-                        print(f"  {note}", flush=True)
-                    time.sleep(wait)
-            # after the inner loop: this model failed all retries -> try fallback
-        if status is not None:
-            status.write(f"Switching to backup model: {FALLBACK_MODEL}")
-        else:
-            print(f"  Switching to backup model: {FALLBACK_MODEL}", flush=True)
-
-    raise last_error  # everything failed
-
-
-# AGENTIC TURN
-def run_agent(client, tavily, history, status):
-    rounds = 0
-    while True:
-        rounds += 1
-        if rounds > MAX_TOOL_ROUNDS:
-            return "Stopped: too many tool calls in one turn."
-
-        response = generate_with_retry(client, history, status)
-        model_content = response.candidates[0].content
-        history.append(model_content)
-
-        if response.function_calls:
-            tool_result_parts = []
-            for call in response.function_calls:
-                args = dict(call.args or {})
-                if call.name == "web_search":
-                    q = args.get("query", "")
-                    status.write(f"Searching the web - *{q}*")
-                    result = do_search(tavily, q)
-                elif call.name == "calculate":
-                    expr = args.get("expression", "")
-                    status.write(f"Newton's Brain calculating - *{expr}*")
-                    result = do_calculate(expr)
-                else:
-                    result = f"Unknown tool: {call.name}"
-                tool_result_parts.append(
-                    types.Part.from_function_response(
-                        name=call.name, response={"result": result}
-                    )
-                )
-            history.append(types.Content(role="user", parts=tool_result_parts))
-        else:
-            return response.text
 
 
 # PAGE CONFIG + STYLING
@@ -250,11 +77,18 @@ st.markdown(
         font-family: 'Cormorant Garamond', serif;
         font-weight: 700; font-size: 4.4rem; line-height: 1;
         letter-spacing: 0.5px; margin: 0.2rem 0 0.1rem;
-        background: linear-gradient(100deg, #8a6cff 0%, #c86dd7 45%, #ff9bc7 100%);
-        -webkit-background-clip: text; background-clip: text;
-        -webkit-text-fill-color: transparent;
+        color: #a06bff;  /* fallback if background-clip:text is unsupported */
         text-shadow: 0 6px 30px rgba(200,150,255,0.25);
         animation: rise 0.9s cubic-bezier(.2,.8,.2,1) both;
+      }
+      /* Only make the text transparent where the gradient can actually be
+         clipped to it — otherwise the title would vanish (e.g. older Firefox). */
+      @supports ((-webkit-background-clip: text) or (background-clip: text)) {
+        .angel-title {
+          background: linear-gradient(100deg, #8a6cff 0%, #c86dd7 45%, #ff9bc7 100%);
+          -webkit-background-clip: text; background-clip: text;
+          -webkit-text-fill-color: transparent;
+        }
       }
       .angel-tag {
         font-family: 'Outfit', sans-serif; font-weight: 300; font-size: 1.02rem;
@@ -360,6 +194,8 @@ if "history" not in st.session_state:
     st.session_state.history = []
 if "display" not in st.session_state:
     st.session_state.display = []
+if "last_audio_id" not in st.session_state:
+    st.session_state.last_audio_id = None  # dedupe: a recording fires only once
 
 # Ability cards in the main area (replaces the sidebar; always visible on mobile)
 st.markdown(
@@ -378,13 +214,66 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Centered Clear button under the cards.
-_left, _mid, _right = st.columns([1, 2, 1])
-with _mid:
+# Controls under the cards: voice-reply toggle + clear.
+_left, _right = st.columns([1, 1])
+with _left:
+    st.toggle("🔊 Voice replies", key="voice_on",
+              help="Speak Angel's answers aloud (Gemini text-to-speech).")
+with _right:
     if st.button("Clear conversation", use_container_width=True, key="clear_main"):
         st.session_state.history = []
         st.session_state.display = []
+        st.session_state.last_audio_id = None
         st.rerun()
+
+# Microphone: record a question instead of typing it.
+audio_in = st.audio_input("🎙️ Or speak to Angel", key="mic")
+
+
+def _maybe_speak(answer: str) -> None:
+    """If voice replies are on, synthesize and autoplay Angel's answer. Never
+    let a TTS failure disrupt the (already shown) text reply."""
+    if not st.session_state.get("voice_on"):
+        return
+    if answer.startswith(("API error", "Error", "Stopped:")):
+        return
+    with st.spinner("Generating voice..."):
+        wav = core.synthesize_speech(client, answer)
+    if wav:
+        st.audio(wav, format="audio/wav", autoplay=True)
+    else:
+        st.caption("🔇 Voice reply unavailable right now.")
+
+
+def handle_prompt(prompt: str) -> None:
+    """Run one full agent turn for a user prompt (typed or transcribed)."""
+    st.session_state.display.append({"role": "user", "text": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    st.session_state.history.append(
+        types.Content(role="user", parts=[types.Part(text=prompt)])
+    )
+    core.trim_history(st.session_state.history)
+
+    with st.chat_message("assistant"):
+        with st.status("Angel is thinking...", expanded=True) as status:
+            try:
+                answer = core.run_agent(
+                    client, tavily, st.session_state.history, CONFIG,
+                    notify=status.write,
+                )
+                status.update(label="Done", state="complete", expanded=False)
+            except genai_errors.APIError as e:
+                answer = f"API error: {e}"
+                status.update(label="Error", state="error")
+            except Exception as e:
+                answer = f"Error: {e}"
+                status.update(label="Error", state="error")
+        st.markdown(answer)
+        _maybe_speak(answer)
+
+    st.session_state.display.append({"role": "assistant", "text": answer})
 
 # CHAT
 if not st.session_state.display:
@@ -398,28 +287,30 @@ for msg in st.session_state.display:
     with st.chat_message(msg["role"]):
         st.markdown(msg["text"])
 
-if prompt := st.chat_input("Message Angel..."):
-    st.session_state.display.append({"role": "user", "text": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+# Resolve this turn's prompt from either the text box or the microphone.
+# Typed text wins; a new recording is transcribed once (deduped by content hash)
+# so reruns don't replay the same audio.
+typed = st.chat_input("Message Angel...")
+prompt = typed
 
-    st.session_state.history.append(
-        types.Content(role="user", parts=[types.Part(text=prompt)])
-    )
-    while len(st.session_state.history) > MAX_HISTORY:
-        st.session_state.history.pop(0)
-
-    with st.chat_message("assistant"):
-        with st.status("Angel is thinking...", expanded=True) as status:
+if not typed and audio_in is not None:
+    audio_bytes = audio_in.getvalue()
+    audio_id = hashlib.sha256(audio_bytes).hexdigest()
+    if audio_id != st.session_state.last_audio_id:
+        st.session_state.last_audio_id = audio_id
+        with st.spinner("Transcribing your voice..."):
             try:
-                answer = run_agent(client, tavily, st.session_state.history, status)
-                status.update(label="Done", state="complete", expanded=False)
-            except genai_errors.APIError as e:
-                answer = f"API error: {e}"
-                status.update(label="Error", state="error")
+                spoken = core.transcribe_audio(
+                    client, audio_bytes,
+                    mime_type=getattr(audio_in, "type", None) or "audio/wav",
+                )
             except Exception as e:
-                answer = f"Error: {e}"
-                status.update(label="Error", state="error")
-        st.markdown(answer)
+                spoken = ""
+                st.warning(f"Could not transcribe the recording: {e}")
+        if spoken:
+            prompt = spoken
+        else:
+            st.info("I couldn't make out any words in that recording — try again.")
 
-    st.session_state.display.append({"role": "assistant", "text": answer})
+if prompt:
+    handle_prompt(prompt)

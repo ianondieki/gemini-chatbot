@@ -31,3 +31,6 @@ Thumbs.db
 
 # Streamlit
 .streamlit/
+
+# RAG embedding cache
+.rag_cache/
