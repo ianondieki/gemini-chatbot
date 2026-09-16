@@ -1,52 +1,40 @@
-"""
-Angel - Gemini agent with web search + calculator (Streamlit UI)
+"""Angel - the same agent as chatbot.py, behind a browser UI.
 
-Same agent as chatbot.py, with a polished browser interface.
-Streamlit re-runs this file top-to-bottom on every interaction, so
-conversation state lives in st.session_state. The agentic loop
-(model -> tool -> feed back -> repeat) is identical to the CLI version.
+Streamlit re-runs this file top to bottom on every interaction, so everything
+that must survive a rerun lives in ``st.session_state`` - including the
+``AgentSession``, which owns the conversation, the toolbox and any indexed
+documents.
+
+The agent is not reimplemented here. It emits the same event stream the CLI
+renders; ``StatusRenderer`` writes those events into the status panel, and the
+full trace is kept per message so it can be reopened after the fact.
 
 Run:  streamlit run app.py
 """
 
-import os
+from __future__ import annotations
+
 import hashlib
+import os
 
 import streamlit as st
-from google import genai
-from google.genai import types
-from google.genai import errors as genai_errors
-from tavily import TavilyClient
 from dotenv import load_dotenv
 
-import agent_core as core
+from gemini_agent import AgentSession, ConfigError, EventRecorder, fan_out
+from gemini_agent.render import StatusRenderer
 
 load_dotenv()
 
-# CONFIGURATION
-APP_NAME = "Angel"
+st.set_page_config(
+    page_title="Angel",
+    page_icon="A",
+    layout="centered",
+    initial_sidebar_state="collapsed",
+)
 
-SYSTEM_PROMPT = """You are Angel, a helpful, friendly AI assistant with two tools:
-- web_search: use it for recent news, current events, live prices, or anything
-  that may have changed after your training cutoff.
-- calculate: use it for any arithmetic, so you never guess at numbers.
-For general knowledge you already know well, just answer directly.
-Always be clear and concise."""
-
-# The agent itself (tools, calculator, search, retry/fallback, agentic loop)
-# lives in agent_core and is shared with the CLI front-end in chatbot.py.
-CONFIG = core.build_config(SYSTEM_PROMPT)
-
-
-@st.cache_resource
-def get_clients():
-    return genai.Client(), TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
-
-
-# PAGE CONFIG + STYLING
-st.set_page_config(page_title=APP_NAME, page_icon="A", layout="centered",
-                   initial_sidebar_state="collapsed")
-
+# --------------------------------------------------------------------------
+# STYLING
+# --------------------------------------------------------------------------
 st.markdown(
     """
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -57,9 +45,7 @@ st.markdown(
         --angel-ink:    #2b2a3d;
         --angel-soft:   #6b6a85;
         --angel-glow:   #c8b6ff;
-        --angel-blush:  #ffd6e8;
         --angel-sky:    #e7f0ff;
-        --angel-cloud:  #faf8ff;
       }
       .stApp {
         background:
@@ -69,20 +55,28 @@ st.markdown(
           linear-gradient(180deg, #fbfaff 0%, #f6f4ff 100%);
       }
       #MainMenu, header[data-testid="stHeader"], footer { visibility: hidden; }
-      .block-container { padding-top: 2.2rem; max-width: 760px; }
-      .angel-hero { text-align: center; margin: 0.5rem 0 1.6rem; }
-      .angel-wing { font-size: 2.4rem; line-height: 1;
-        filter: drop-shadow(0 4px 14px rgba(200,182,255,0.7)); }
+      [data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"] {
+        display: none !important;
+      }
+      .block-container { padding-top: 2.2rem; max-width: 780px; }
+      .stApp, .stMarkdown, p, li {
+        font-family: 'Outfit', sans-serif; color: var(--angel-ink);
+      }
+      .angel-hero { text-align: center; margin: 0.5rem 0 1.2rem; }
+      .angel-wing {
+        font-size: 2.4rem; line-height: 1;
+        filter: drop-shadow(0 4px 14px rgba(200,182,255,0.7));
+      }
       .angel-title {
         font-family: 'Cormorant Garamond', serif;
         font-weight: 700; font-size: 4.4rem; line-height: 1;
         letter-spacing: 0.5px; margin: 0.2rem 0 0.1rem;
-        color: #a06bff;  /* fallback if background-clip:text is unsupported */
+        color: #a06bff;  /* fallback where background-clip:text is unsupported */
         text-shadow: 0 6px 30px rgba(200,150,255,0.25);
         animation: rise 0.9s cubic-bezier(.2,.8,.2,1) both;
       }
-      /* Only make the text transparent where the gradient can actually be
-         clipped to it — otherwise the title would vanish (e.g. older Firefox). */
+      /* Only go transparent where the gradient can actually be clipped to the
+         text - otherwise the title disappears entirely (older Firefox). */
       @supports ((-webkit-background-clip: text) or (background-clip: text)) {
         .angel-title {
           background: linear-gradient(100deg, #8a6cff 0%, #c86dd7 45%, #ff9bc7 100%);
@@ -103,9 +97,8 @@ st.markdown(
         from { opacity: 0; transform: translateY(12px); }
         to   { opacity: 1; transform: translateY(0); }
       }
-      .stApp, .stMarkdown, p, li { font-family: 'Outfit', sans-serif; color: var(--angel-ink); }
       [data-testid="stChatMessage"] {
-        border-radius: 20px; padding: 0.4rem 0.4rem; margin-bottom: 0.5rem;
+        border-radius: 20px; padding: 0.4rem; margin-bottom: 0.5rem;
         box-shadow: 0 6px 24px rgba(140,120,200,0.10);
         border: 1px solid rgba(200,182,255,0.25);
         backdrop-filter: blur(6px); background: rgba(255,255,255,0.55);
@@ -117,13 +110,6 @@ st.markdown(
         background: rgba(255,255,255,0.75);
       }
       [data-testid="stChatInput"] textarea { font-family: 'Outfit', sans-serif; }
-      [data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #f5f0ff 0%, #eef3ff 100%);
-        border-right: 1px solid rgba(200,182,255,0.35);
-      }
-      [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h1 {
-        font-family: 'Cormorant Garamond', serif; color: var(--angel-ink);
-      }
       .stButton button {
         border-radius: 14px; border: 1px solid rgba(200,182,255,0.6);
         background: rgba(255,255,255,0.7); color: var(--angel-ink);
@@ -135,18 +121,15 @@ st.markdown(
         box-shadow: 0 4px 16px rgba(160,130,230,0.3);
         transform: translateY(-1px);
       }
-      /* Hide the sidebar entirely (mobile-friendly: nothing to toggle) */
-      [data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"] { display: none !important; }
-      /* Ability cards in the main area */
       .angel-cards {
-        display: flex; gap: 0.8rem; justify-content: center;
-        flex-wrap: wrap; margin: 0.2rem 0 1.4rem;
+        display: flex; gap: 0.7rem; justify-content: center;
+        flex-wrap: wrap; margin: 0.2rem 0 1.2rem;
       }
       .angel-card {
-        flex: 1 1 200px; max-width: 300px;
+        flex: 1 1 170px; max-width: 250px;
         background: rgba(255,255,255,0.6);
         border: 1px solid rgba(200,182,255,0.35);
-        border-radius: 18px; padding: 1rem 1.2rem;
+        border-radius: 18px; padding: 0.9rem 1.1rem;
         box-shadow: 0 6px 22px rgba(140,120,200,0.10);
         backdrop-filter: blur(6px);
         transition: transform 0.2s ease, box-shadow 0.2s ease;
@@ -157,11 +140,11 @@ st.markdown(
       }
       .angel-card-title {
         font-family: 'Cormorant Garamond', serif; font-weight: 600;
-        font-size: 1.25rem; color: var(--angel-ink); margin-bottom: 0.2rem;
+        font-size: 1.2rem; margin-bottom: 0.15rem;
       }
       .angel-card-desc {
         font-family: 'Outfit', sans-serif; font-weight: 300;
-        font-size: 0.92rem; color: var(--angel-soft);
+        font-size: 0.88rem; color: var(--angel-soft);
       }
     </style>
     """,
@@ -173,144 +156,288 @@ st.markdown(
     <div class="angel-hero">
       <div class="angel-wing">&#128330;</div>
       <div class="angel-title">Angel</div>
-      <div class="angel-tag">your celestial assistant</div>
+      <div class="angel-tag">plans &middot; acts &middot; checks its work</div>
       <div class="angel-rule"></div>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-# GUARDS + CLIENTS
-if not os.getenv("GEMINI_API_KEY"):
-    st.error("GEMINI_API_KEY not found in .env")
-    st.stop()
-if not os.getenv("TAVILY_API_KEY"):
-    st.error("TAVILY_API_KEY not found in .env")
-    st.stop()
 
-client, tavily = get_clients()
+# --------------------------------------------------------------------------
+# SESSION
+# --------------------------------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def get_shared_client():
+    """One HTTP client per server process - safe to share between visitors."""
+    from google import genai
 
-if "history" not in st.session_state:
-    st.session_state.history = []
-if "display" not in st.session_state:
-    st.session_state.display = []
-if "last_audio_id" not in st.session_state:
-    st.session_state.last_audio_id = None  # dedupe: a recording fires only once
+    return genai.Client()
 
-# Ability cards in the main area (replaces the sidebar; always visible on mobile)
-st.markdown(
+
+def get_session() -> AgentSession:
+    """One agent per *browser session*.
+
+    Deliberately not ``@st.cache_resource``: that caches per server process, so
+    every visitor would share one conversation, one set of notes and one loaded
+    document. Only the transport client below is shared.
     """
-    <div class="angel-cards">
-      <div class="angel-card">
-        <div class="angel-card-title">Web search</div>
-        <div class="angel-card-desc">Live results from across the web for anything current.</div>
-      </div>
-      <div class="angel-card">
-        <div class="angel-card-title">Newton&#39;s Brain</div>
-        <div class="angel-card-desc">Exact math, calculated with Newton-grade precision.</div>
-      </div>
-    </div>
-    """,
+    if "agent" not in st.session_state:
+        if not (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")):
+            raise ConfigError(
+                "GEMINI_API_KEY is not set. Put it in a .env file next to this "
+                "script (see .env.example)."
+            )
+        st.session_state.agent = AgentSession.create(
+            name="Angel", client=get_shared_client()
+        )
+    return st.session_state.agent
+
+
+try:
+    session = get_session()
+except ConfigError as exc:
+    st.error(str(exc))
+    st.stop()
+except Exception as exc:  # a bad key surfaces here, not as a stack trace
+    st.error(f"Could not start Angel: {type(exc).__name__}: {exc}")
+    st.stop()
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "indexed" not in st.session_state:
+    st.session_state.indexed = None
+if "last_audio" not in st.session_state:
+    st.session_state.last_audio = None   # dedupe: a recording runs once, not per rerun
+
+
+# --------------------------------------------------------------------------
+# CAPABILITY CARDS
+# --------------------------------------------------------------------------
+CARD_COPY = {
+    "web_search": ("Web search", "Live results for anything current."),
+    "fetch_page": ("Read a page", "Opens a source and reads it properly."),
+    "calculate": ("Exact maths", "Every figure calculated, never estimated."),
+    "current_datetime": ("Today's date", "Knows what day it actually is."),
+    "search_documents": ("Your document", "Searches the PDF you upload."),
+    "remember": ("Memory", "Keeps what matters as the chat grows."),
+    "delegate": ("Sub-agents", "Hands big subtasks to a focused helper."),
+}
+
+cards = [CARD_COPY[name] for name in session.tool_names if name in CARD_COPY][:4]
+st.markdown(
+    '<div class="angel-cards">'
+    + "".join(
+        f'<div class="angel-card"><div class="angel-card-title">{title}</div>'
+        f'<div class="angel-card-desc">{description}</div></div>'
+        for title, description in cards
+    )
+    + "</div>",
     unsafe_allow_html=True,
 )
 
-# Controls under the cards: voice-reply toggle + clear.
-_left, _right = st.columns([1, 1])
-with _left:
-    st.toggle("🔊 Voice replies", key="voice_on",
-              help="Speak Angel's answers aloud (Gemini text-to-speech).")
-with _right:
-    if st.button("Clear conversation", use_container_width=True, key="clear_main"):
-        st.session_state.history = []
-        st.session_state.display = []
-        st.session_state.last_audio_id = None
+if session.search_client is None:
+    st.info("No TAVILY_API_KEY, so Angel cannot search the web this session.")
+
+
+# --------------------------------------------------------------------------
+# CONTROLS
+# --------------------------------------------------------------------------
+with st.expander("Document and settings", expanded=False):
+    uploaded = st.file_uploader(
+        "Give Angel a PDF to search", type="pdf",
+        help="Retrieval becomes one of Angel's tools, so it can search the "
+             "document, calculate with what it finds, and check the web too.",
+    )
+
+    if uploaded is not None:
+        file_id = f"{uploaded.name}-{uploaded.size}"
+        if st.session_state.indexed != file_id:
+            with st.status(f"Indexing {uploaded.name}...", expanded=True) as status:
+                bar = st.progress(0.0)
+
+                def progress(done: int, total: int) -> None:
+                    bar.progress(done / total, text=f"Embedded {done}/{total} chunks")
+
+                try:
+                    added = session.load_pdf(
+                        uploaded, uploaded.name, progress, file_id=file_id
+                    )
+                except Exception as exc:
+                    status.update(label="Indexing failed", state="error")
+                    st.error(
+                        f"{exc}\n\nOn the free tier this is usually the embedding "
+                        "rate limit - wait a minute and try again, or use a "
+                        "smaller PDF."
+                    )
+                else:
+                    st.session_state.indexed = file_id
+                    label = (
+                        f"Loaded {added} cached chunks from {uploaded.name}"
+                        if session.documents.cache_hit
+                        else f"Indexed {added} chunks from {uploaded.name}"
+                    )
+                    status.update(label=label, state="complete", expanded=False)
+
+    if session.documents is not None and not session.documents.is_empty:
+        st.caption(f"Loaded: {session.documents.describe()}")
+        if st.button("Remove document", use_container_width=True):
+            session.unload_documents()
+            st.session_state.indexed = None
+            st.rerun()
+
+    st.divider()
+
+    left, right = st.columns(2)
+    with left:
+        planning = st.selectbox(
+            "Planning",
+            ["auto", "always", "never"],
+            index=["auto", "always", "never"].index(session.config.planning),
+            help="How often Angel drafts an explicit plan before acting.",
+        )
+    with right:
+        reflections = st.slider(
+            "Review passes", 0, 3, session.config.max_reflections,
+            help="How many times Angel may reject its own draft and try again.",
+        )
+
+    if (
+        planning != session.config.planning
+        or reflections != session.config.max_reflections
+    ):
+        session.reconfigure(planning=planning, max_reflections=reflections)
+
+    st.caption(
+        f"Model {session.config.model} - tools: {', '.join(session.tool_names)}"
+    )
+
+_voice, _clear = st.columns([1, 1])
+with _voice:
+    st.toggle(
+        "Voice replies",
+        key="voice_on",
+        help="Speak Angel's answers aloud, using Gemini text-to-speech.",
+    )
+with _clear:
+    if st.button("Clear conversation", use_container_width=True):
+        session.clear()
+        st.session_state.messages = []
+        st.session_state.last_audio = None
         st.rerun()
 
-# Microphone: record a question instead of typing it.
-audio_in = st.audio_input("🎙️ Or speak to Angel", key="mic")
+# Microphone: ask by speaking instead of typing.
+recording = st.audio_input("Or speak to Angel")
 
 
-def _maybe_speak(answer: str) -> None:
-    """If voice replies are on, synthesize and autoplay Angel's answer. Never
-    let a TTS failure disrupt the (already shown) text reply."""
-    if not st.session_state.get("voice_on"):
-        return
-    if answer.startswith(("API error", "Error", "Stopped:")):
-        return
-    with st.spinner("Generating voice..."):
-        wav = core.synthesize_speech(client, answer)
-    if wav:
-        st.audio(wav, format="audio/wav", autoplay=True)
-    else:
-        st.caption("🔇 Voice reply unavailable right now.")
-
-
-def handle_prompt(prompt: str) -> None:
-    """Run one full agent turn for a user prompt (typed or transcribed)."""
-    st.session_state.display.append({"role": "user", "text": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    st.session_state.history.append(
-        types.Content(role="user", parts=[types.Part(text=prompt)])
-    )
-    core.trim_history(st.session_state.history)
-
-    with st.chat_message("assistant"):
-        with st.status("Angel is thinking...", expanded=True) as status:
-            try:
-                answer = core.run_agent(
-                    client, tavily, st.session_state.history, CONFIG,
-                    notify=status.write,
-                )
-                status.update(label="Done", state="complete", expanded=False)
-            except genai_errors.APIError as e:
-                answer = f"API error: {e}"
-                status.update(label="Error", state="error")
-            except Exception as e:
-                answer = f"Error: {e}"
-                status.update(label="Error", state="error")
-        st.markdown(answer)
-        _maybe_speak(answer)
-
-    st.session_state.display.append({"role": "assistant", "text": answer})
-
+# --------------------------------------------------------------------------
 # CHAT
-if not st.session_state.display:
+# --------------------------------------------------------------------------
+def render_trace(events) -> None:
+    """Replay a finished turn's event stream inside an expander."""
+    for event in events:
+        if event.kind in ("plan_ready", "replanned"):
+            label = "Re-planned" if event.kind == "replanned" else "Planned"
+            st.markdown(f"**{label}:** {event.goal}")
+            for step in event.steps:
+                st.markdown(f"- {step}")
+        elif event.kind == "tool_started":
+            arguments = ", ".join(f"{k}={v}" for k, v in event.args.items())
+            st.markdown(
+                f"**{event.name}** `{arguments[:200]}`" if arguments
+                else f"**{event.name}**"
+            )
+        elif event.kind == "tool_finished" and not event.ok:
+            st.markdown(f":red[failed] {event.preview}")
+        elif event.kind == "reflection":
+            if event.verdict == "accept":
+                st.markdown(f":green[Review passed] ({event.confidence:.0%})")
+            else:
+                st.markdown(f":orange[Revised:] {'; '.join(event.issues[:3])}")
+        elif event.kind == "turn_finished":
+            st.caption(
+                f"{event.steps} steps - {event.tool_calls} tool calls - "
+                f"{event.elapsed:.1f}s"
+            )
+
+
+if not st.session_state.messages:
     st.markdown(
         "<p style='text-align:center;color:#6b6a85;font-size:1.05rem;'>"
-        "Ask me about today's news, a tricky calculation, or anything at all.</p>",
+        "Ask about today's news, a calculation worth getting right, or upload "
+        "a PDF and ask about that.</p>",
         unsafe_allow_html=True,
     )
 
-for msg in st.session_state.display:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["text"])
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["text"])
+        if message.get("events"):
+            with st.expander("How Angel worked this out"):
+                render_trace(message["events"])
 
-# Resolve this turn's prompt from either the text box or the microphone.
-# Typed text wins; a new recording is transcribed once (deduped by content hash)
-# so reruns don't replay the same audio.
-typed = st.chat_input("Message Angel...")
-prompt = typed
+def speak(answer: str) -> None:
+    """Play an answer aloud when voice replies are on.
 
-if not typed and audio_in is not None:
-    audio_bytes = audio_in.getvalue()
-    audio_id = hashlib.sha256(audio_bytes).hexdigest()
-    if audio_id != st.session_state.last_audio_id:
-        st.session_state.last_audio_id = audio_id
-        with st.spinner("Transcribing your voice..."):
+    Synthesis failing is a downgrade, not an error - the text answer is
+    already on screen, so this only ever adds a quiet caption.
+    """
+    if not st.session_state.get("voice_on"):
+        return
+    with st.spinner("Generating voice..."):
+        audio = session.speak(answer)
+    if audio:
+        st.audio(audio, format="audio/wav", autoplay=True)
+    else:
+        st.caption("Voice reply unavailable right now.")
+
+
+# This turn's prompt comes from the text box or the microphone. Typed text
+# wins; a recording is transcribed once, keyed by content hash, so Streamlit's
+# reruns do not replay the same audio over and over.
+prompt = st.chat_input("Message Angel...")
+
+if not prompt and recording is not None:
+    audio_bytes = recording.getvalue()
+    fingerprint = hashlib.sha256(audio_bytes).hexdigest()
+    if fingerprint != st.session_state.last_audio:
+        st.session_state.last_audio = fingerprint
+        with st.spinner("Transcribing..."):
             try:
-                spoken = core.transcribe_audio(
-                    client, audio_bytes,
-                    mime_type=getattr(audio_in, "type", None) or "audio/wav",
+                prompt = session.transcribe(
+                    audio_bytes,
+                    mime_type=getattr(recording, "type", None) or "audio/wav",
                 )
-            except Exception as e:
-                spoken = ""
-                st.warning(f"Could not transcribe the recording: {e}")
-        if spoken:
-            prompt = spoken
-        else:
-            st.info("I couldn't make out any words in that recording — try again.")
+            except Exception as exc:
+                st.warning(f"Could not transcribe that recording: {exc}")
+        if not prompt:
+            st.info("I could not make out any words in that recording.")
 
 if prompt:
-    handle_prompt(prompt)
+    st.session_state.messages.append({"role": "user", "text": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        recorder = EventRecorder()
+        with st.status("Angel is thinking...", expanded=True) as status:
+            sink = fan_out(recorder, StatusRenderer(status))
+            result = session.ask(prompt, sink=sink)
+            status.update(
+                label="Done" if result.ok else "Something went wrong",
+                state="complete" if result.ok else "error",
+                expanded=False,
+            )
+        st.markdown(result.answer)
+
+        # Render the trace for this turn too, not just for past ones - otherwise
+        # the message you just sent is the only one you cannot inspect.
+        if recorder.events:
+            with st.expander("How Angel worked this out"):
+                render_trace(recorder.events)
+
+        speak(result.answer)
+
+    st.session_state.messages.append(
+        {"role": "assistant", "text": result.answer, "events": recorder.events}
+    )

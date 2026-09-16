@@ -1,348 +1,238 @@
-"""
-Chat with your PDF - a standalone RAG app (Gemini embeddings + NumPy search)
+"""Chat with your PDF - retrieval as an agent loop, not a single lookup.
 
-RAG = Retrieval Augmented Generation:
-  1. CHUNK    - split the pdf text into small pieces
-  2. EMBED    - turn each chunk into a vector (numbers capturing meaning)
-  3. STORE    - keep those vectors in memory
-  4. RETRIEVE - embed the question, find the most similar chunks (semantic search)
-  5. ANSWER   - hand those chunks to the model so it answers FROM the pdf
+Classic RAG does one pass: embed the question, fetch the nearest chunks, answer
+from them. It works until the answer is phrased differently from the question -
+ask about "the penalty for filing late" and a section headed "Remedies" is
+never retrieved, so the model answers "not in the document" about a document
+that plainly covers it.
 
-This version is hardened for LARGE PDFs: it retries on rate limits, paces the
-requests, shows progress, and caps very large books so indexing stays sane.
+Here retrieval is a *tool* instead. The agent searches, reads what came back,
+notices the gap, and searches again using the document's own vocabulary. It can
+also calculate with what it finds, and it reviews its own draft before
+answering - so an unsupported claim gets caught rather than shipped.
+
+The pipeline underneath is the same five steps, and they are still worth
+knowing: CHUNK, EMBED, STORE, RETRIEVE, ANSWER. They live in
+``gemini_agent/rag/``.
 
 Run:  streamlit run rag_app.py
 """
 
-import os
-import json
-import time
-import hashlib
+from __future__ import annotations
 
-import numpy as np
+import hashlib
+import os
+
 import streamlit as st
-from pypdf import PdfReader
-from google import genai
-from google.genai import types
-from google.genai import errors as genai_errors
 from dotenv import load_dotenv
 
-import agent_core as core  # shared Gemini voice helpers (STT/TTS)
+from gemini_agent import AgentConfig, AgentSession, ConfigError, EventRecorder, fan_out
+from gemini_agent.render import StatusRenderer
 
 load_dotenv()
 
-# CONFIGURATION
-CHAT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-EMBED_MODEL = "gemini-embedding-001"
-EMBED_DIM = 768
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 150
-TOP_K = 4
+st.set_page_config(page_title="Chat with your PDF", page_icon="P", layout="centered")
 
-# Large-PDF controls
-EMBED_BATCH = 10          # chunks per embedding request (smaller = safer)
-INTER_BATCH_DELAY = 0.3   # seconds to pause between batches (eases rate limits)
-EMBED_RETRIES = 5         # attempts per batch on transient errors
-# Safety cap on how many chunks we EMBED. The brute-force NumPy search handles
-# far more than this fine — the cap exists purely to keep embedding within
-# free-tier quota. Raise it (RAG_MAX_CHUNKS) if your quota allows.
-MAX_CHUNKS = int(os.getenv("RAG_MAX_CHUNKS", "1200"))
+DOCUMENT_RULES = """This conversation is about the document the user loaded.
 
-# On-disk cache so re-uploading the same PDF skips re-embedding (slow + quota).
-CACHE_DIR = os.getenv("RAG_CACHE_DIR", ".rag_cache")
-
-SYSTEM_RULE = (
-    "You answer questions about an uploaded document. Use ONLY the context "
-    "provided. If the answer is not in the context, say you could not find it "
-    "in the document. Be clear and concise, and quote figures exactly."
-)
+Ground every factual claim in passages from search_documents, and cite the page
+you took each figure from. Search more than once when the first passages are
+thin - rephrase using the document's own vocabulary rather than the user's.
+When the document genuinely does not cover something, say so plainly instead of
+reasoning around the gap; if you then add what you know from outside the
+document, label it clearly as outside the document."""
 
 
-@st.cache_resource
-def get_client():
+@st.cache_resource(show_spinner=False)
+def get_shared_client():
+    """One HTTP client per server process - safe to share between visitors."""
+    from google import genai
+
     return genai.Client()
 
 
-# 1. CHUNK
-def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
-    text = " ".join(text.split())
-    chunks = []
-    start = 0
-    while start < len(text):
-        chunks.append(text[start:start + size])
-        start += size - overlap
-    return [c for c in chunks if c.strip()]
+def get_session() -> AgentSession:
+    """One agent per *browser session*.
 
-
-# 2. EMBED (hardened: retry + backoff + pacing + progress)
-def _embed_batch_with_retry(client, batch, task_type):
-    """Embed one batch, retrying on transient rate-limit / overload errors."""
-    last_error = None
-    for attempt in range(1, EMBED_RETRIES + 1):
-        try:
-            resp = client.models.embed_content(
-                model=EMBED_MODEL,
-                contents=batch,
-                config=types.EmbedContentConfig(
-                    task_type=task_type, output_dimensionality=EMBED_DIM
-                ),
+    Deliberately not ``@st.cache_resource``: that caches per server process, so
+    every visitor would share one conversation, one set of notes and one loaded
+    document. Only the transport client below is shared.
+    """
+    if "agent" not in st.session_state:
+        if not (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")):
+            raise ConfigError(
+                "GEMINI_API_KEY is not set. Put it in a .env file next to this "
+                "script (see .env.example)."
             )
-            return [e.values for e in resp.embeddings]
-        except genai_errors.APIError as e:
-            msg = str(e)
-            transient = (
-                "429" in msg or "RESOURCE_EXHAUSTED" in msg
-                or "rate" in msg.lower() or "quota" in msg.lower()
-                or "503" in msg or "UNAVAILABLE" in msg
-                or "overloaded" in msg.lower()
-            )
-            if not transient:
-                raise  # a real error (bad request / key) - don't retry
-            last_error = e
-            if attempt < EMBED_RETRIES:
-                time.sleep(2 ** (attempt - 1))  # 1s, 2s, 4s, 8s...
-    raise last_error
+        st.session_state.agent = AgentSession.create(
+            config=AgentConfig.from_env(),
+            name="the document assistant",
+            client=get_shared_client(),
+            enable_search=False,
+            enable_delegation=False,
+            extra_instructions=DOCUMENT_RULES,
+        )
+    return st.session_state.agent
 
 
-def embed_texts(client, texts, task_type, progress=None):
-    """Embed a list of strings into a NumPy matrix. `progress` is an optional
-    callback(done, total) used to drive a Streamlit progress bar."""
-    vectors = []
-    total = len(texts)
-    for i in range(0, total, EMBED_BATCH):
-        batch = texts[i:i + EMBED_BATCH]
-        vectors.extend(_embed_batch_with_retry(client, batch, task_type))
-        if progress is not None:
-            progress(min(i + EMBED_BATCH, total), total)
-        if i + EMBED_BATCH < total:
-            time.sleep(INTER_BATCH_DELAY)
-    return np.array(vectors, dtype="float32")
+st.title("Chat with your PDF")
 
+try:
+    session = get_session()
+except ConfigError as exc:
+    st.error(str(exc))
+    st.stop()
+except Exception as exc:
+    st.error(f"Could not start: {type(exc).__name__}: {exc}")
+    st.stop()
 
-# 4. RETRIEVE
-def top_k_chunks(query_vec, doc_matrix, k=TOP_K):
-    q = query_vec / (np.linalg.norm(query_vec) + 1e-10)
-    d = doc_matrix / (np.linalg.norm(doc_matrix, axis=1, keepdims=True) + 1e-10)
-    sims = d @ q
-    idx = np.argsort(-sims)[:k]
-    return idx, sims[idx]
+st.caption(
+    f"Embeddings: {session.config.embed_model} - answers: {session.config.model} - "
+    f"retrieval runs as a tool, so the agent can search repeatedly"
+)
 
+if "rag_messages" not in st.session_state:
+    st.session_state.rag_messages = []
+if "rag_file" not in st.session_state:
+    st.session_state.rag_file = None
+if "rag_last_audio" not in st.session_state:
+    st.session_state.rag_last_audio = None
 
-# 5. ANSWER
-def answer_question(client, question, chunks, embeddings):
-    q_vec = embed_texts(client, [question], task_type="RETRIEVAL_QUERY")[0]
-    idx, scores = top_k_chunks(q_vec, embeddings)
-    context = "\n\n---\n\n".join(chunks[i] for i in idx)
-    prompt = (
-        f"{SYSTEM_RULE}\n\n"
-        f"Context from the document:\n{context}\n\n"
-        f"Question: {question}"
-    )
-    resp = client.models.generate_content(
-        model=CHAT_MODEL,
-        contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
-    )
-    return resp.text, idx, scores
+# ---------------------------------------------------------------- INDEXING
+uploaded = st.file_uploader("Upload a PDF", type="pdf")
 
+if uploaded is not None:
+    file_id = f"{uploaded.name}-{uploaded.size}"
+    if st.session_state.rag_file != file_id:
+        with st.status(f"Indexing {uploaded.name}...", expanded=True) as status:
+            status.write("Reading the PDF and splitting it into chunks...")
+            bar = st.progress(0.0)
 
-# 6. EMBEDDING CACHE (so re-uploading the same PDF is instant)
-# The key folds in the file id AND the indexing parameters, so changing the
-# embed model, dimension, or chunk size correctly invalidates a stale cache.
-def _cache_key(file_id):
-    raw = f"{file_id}|{EMBED_MODEL}|{EMBED_DIM}|{CHUNK_SIZE}|{CHUNK_OVERLAP}|{MAX_CHUNKS}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+            def progress(done: int, total: int) -> None:
+                bar.progress(done / total, text=f"Embedded {done}/{total} chunks")
 
-
-def load_cache(file_id, cache_dir=CACHE_DIR):
-    """Return (chunks, embeddings) for this file if cached, else None."""
-    base = os.path.join(cache_dir, _cache_key(file_id))
-    chunks_path, emb_path = base + ".chunks.json", base + ".emb.npy"
-    if not (os.path.exists(chunks_path) and os.path.exists(emb_path)):
-        return None
-    try:
-        with open(chunks_path, encoding="utf-8") as f:
-            chunks = json.load(f)
-        embeddings = np.load(emb_path)
-        return chunks, embeddings
-    except Exception:
-        return None  # corrupt/partial cache — treat as a miss and re-embed
-
-
-def save_cache(file_id, chunks, embeddings, cache_dir=CACHE_DIR):
-    """Persist chunks + embeddings; best-effort (cache failures never block use)."""
-    try:
-        os.makedirs(cache_dir, exist_ok=True)
-        base = os.path.join(cache_dir, _cache_key(file_id))
-        with open(base + ".chunks.json", "w", encoding="utf-8") as f:
-            json.dump(chunks, f)
-        np.save(base + ".emb.npy", embeddings)
-    except Exception:
-        pass
-
-
-# UI
-# Wrapped in main() so the pure functions above (chunk_text, top_k_chunks, ...)
-# can be imported by tests without executing any Streamlit code. `streamlit run
-# rag_app.py` runs this file as __main__, so the app still launches normally.
-def main():
-    st.set_page_config(page_title="Chat with your PDF", page_icon="P", layout="centered")
-    st.title("Chat with your PDF")
-    st.caption(f"RAG demo - embeddings: {EMBED_MODEL} - answers: {CHAT_MODEL}")
-
-    if not os.getenv("GEMINI_API_KEY"):
-        st.error("GEMINI_API_KEY not found in .env")
-        st.stop()
-
-    client = get_client()
-
-    for key in ("rag_chunks", "rag_emb", "rag_file", "rag_msgs"):
-        if key not in st.session_state:
-            st.session_state[key] = None if key != "rag_msgs" else []
-    if "rag_last_audio_id" not in st.session_state:
-        st.session_state.rag_last_audio_id = None  # dedupe recordings
-
-    uploaded = st.file_uploader("Upload a PDF", type="pdf")
-
-    if uploaded is not None:
-        file_id = f"{uploaded.name}-{uploaded.size}"
-        if st.session_state.rag_file != file_id:
-            with st.status("Indexing your PDF...", expanded=True) as status:
-                capped = False
-
-                # Fast path: this exact PDF was indexed before — load from disk.
-                cached = load_cache(file_id)
-                if cached is not None:
-                    status.write("Found a cached index — loading instead of re-embedding...")
-                    chunks, embeddings = cached
-                else:
-                    status.write("Reading text from the PDF...")
-                    reader = PdfReader(uploaded)
-                    raw = "\n".join((page.extract_text() or "") for page in reader.pages)
-
-                    if not raw.strip():
-                        status.update(label="No selectable text found", state="error")
-                        st.warning(
-                            "This PDF has no extractable text (it may be scanned images). "
-                            "Try a text-based PDF."
-                        )
-                        st.stop()
-
-                    status.write("Splitting into chunks...")
-                    chunks = chunk_text(raw)
-
-                    # Cap very large documents so embedding stays within free-tier quota.
-                    if len(chunks) > MAX_CHUNKS:
-                        capped = True
-                        chunks = chunks[:MAX_CHUNKS]
-
-                    status.write(f"Embedding {len(chunks)} chunks (this can take a while)...")
-                    bar = st.progress(0.0)
-
-                    def _update(done, total):
-                        bar.progress(done / total, text=f"Embedded {done}/{total} chunks")
-
-                    try:
-                        embeddings = embed_texts(
-                            client, chunks, task_type="RETRIEVAL_DOCUMENT", progress=_update
-                        )
-                    except genai_errors.APIError as e:
-                        status.update(label="Embedding failed", state="error")
-                        st.error(
-                            f"Embedding error after retries: {e}\n\n"
-                            "This usually means the free-tier rate limit was hit. "
-                            "Try a smaller PDF, or wait a minute and re-upload."
-                        )
-                        st.stop()
-
-                    save_cache(file_id, chunks, embeddings)
-
-                st.session_state.rag_chunks = chunks
-                st.session_state.rag_emb = embeddings
-                st.session_state.rag_file = file_id
-                st.session_state.rag_msgs = []
-
-                label = f"Indexed {len(chunks)} chunks from {uploaded.name}"
-                if capped:
-                    label += f" (capped at {MAX_CHUNKS}; later pages not indexed)"
-                status.update(label=label, state="complete", expanded=False)
-
-            if capped:
-                st.warning(
-                    f"This PDF was large, so only the first {MAX_CHUNKS} chunks were "
-                    "indexed. Questions about later pages may not be answerable. For a "
-                    "full book, a vector database (e.g. ChromaDB) is the next step."
+            try:
+                session.unload_documents()
+                added = session.load_pdf(
+                    uploaded, uploaded.name, progress, file_id=file_id
                 )
+            except Exception as exc:
+                status.update(label="Indexing failed", state="error")
+                st.error(
+                    f"{exc}\n\nOn the free tier this is usually the embedding "
+                    "rate limit. Wait a minute and re-upload, or try a smaller "
+                    "PDF."
+                )
+                st.stop()
 
-    if st.session_state.rag_chunks is not None:
-        st.toggle("🔊 Voice replies", key="rag_voice_on",
-                  help="Speak the answer aloud (Gemini text-to-speech).")
-        audio_in = st.audio_input("🎙️ Or ask out loud", key="rag_mic")
+            st.session_state.rag_file = file_id
+            st.session_state.rag_messages = []
+            session.clear()
+            label = (
+                f"Loaded {added} cached chunks from {uploaded.name}"
+                if session.documents.cache_hit
+                else f"Indexed {added} chunks from {uploaded.name}"
+            )
+            status.update(label=label, state="complete", expanded=False)
 
-        for m in st.session_state.rag_msgs:
-            with st.chat_message(m["role"]):
-                st.markdown(m["text"])
+        if session.documents.index.truncated:
+            st.warning(
+                f"That PDF was large, so only the first {session.config.max_chunks} "
+                "chunks were indexed - later pages are not searchable. For a "
+                "whole book, a real vector database (ChromaDB, pgvector) is the "
+                "next step."
+            )
 
-        # Resolve the question from the text box or the microphone. Typed text
-        # wins; a new recording is transcribed once (deduped by content hash).
-        typed = st.chat_input("Ask a question about the document...")
-        q = typed
-        if not typed and audio_in is not None:
-            audio_bytes = audio_in.getvalue()
-            audio_id = hashlib.sha256(audio_bytes).hexdigest()
-            if audio_id != st.session_state.rag_last_audio_id:
-                st.session_state.rag_last_audio_id = audio_id
-                with st.spinner("Transcribing your voice..."):
-                    try:
-                        spoken = core.transcribe_audio(
-                            client, audio_bytes,
-                            mime_type=getattr(audio_in, "type", None) or "audio/wav",
-                        )
-                    except Exception as e:
-                        spoken = ""
-                        st.warning(f"Could not transcribe the recording: {e}")
-                if spoken:
-                    q = spoken
-                else:
-                    st.info("I couldn't make out any words — try again.")
+# ------------------------------------------------------------------- CHAT
+if session.documents is None or session.documents.is_empty:
+    st.info("Upload a PDF above to get started.")
+    st.stop()
 
-        if q:
-            st.session_state.rag_msgs.append({"role": "user", "text": q})
-            with st.chat_message("user"):
-                st.markdown(q)
+st.caption(f"Loaded: {session.documents.describe()}")
 
-            with st.chat_message("assistant"):
-                with st.spinner("Searching the document..."):
-                    try:
-                        answer, idx, scores = answer_question(
-                            client, q,
-                            st.session_state.rag_chunks,
-                            st.session_state.rag_emb,
-                        )
-                    except genai_errors.APIError as e:
-                        answer, idx, scores = f"API error: {e}", [], []
+st.toggle(
+    "Voice replies",
+    key="rag_voice_on",
+    help="Read the answer aloud, using Gemini text-to-speech.",
+)
+recording = st.audio_input("Or ask your question out loud")
 
-                st.markdown(answer)
+for message in st.session_state.rag_messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["text"])
+        if message.get("sources"):
+            with st.expander("Passages the answer was built from"):
+                for source in message["sources"]:
+                    st.markdown(f"**{source['label']}**")
+                    st.caption(source["text"])
 
-                # Speak the answer if voice replies are on (never break on TTS).
-                if st.session_state.get("rag_voice_on") and not answer.startswith("API error"):
-                    with st.spinner("Generating voice..."):
-                        wav = core.synthesize_speech(client, answer)
-                    if wav:
-                        st.audio(wav, format="audio/wav", autoplay=True)
-                    else:
-                        st.caption("🔇 Voice reply unavailable right now.")
+# Typed question wins; a recording is transcribed once, keyed by content hash.
+question = st.chat_input("Ask a question about the document...")
 
-                if len(idx) > 0:
-                    with st.expander("Sources used (retrieved chunks)"):
-                        for i, s in zip(idx, scores):
-                            st.markdown(f"**Chunk {int(i)}** - similarity {s:.3f}")
-                            snippet = st.session_state.rag_chunks[int(i)]
-                            st.caption(snippet[:400] + ("..." if len(snippet) > 400 else ""))
+if not question and recording is not None:
+    audio_bytes = recording.getvalue()
+    fingerprint = hashlib.sha256(audio_bytes).hexdigest()
+    if fingerprint != st.session_state.rag_last_audio:
+        st.session_state.rag_last_audio = fingerprint
+        with st.spinner("Transcribing..."):
+            try:
+                question = session.transcribe(
+                    audio_bytes,
+                    mime_type=getattr(recording, "type", None) or "audio/wav",
+                )
+            except Exception as exc:
+                st.warning(f"Could not transcribe that recording: {exc}")
+        if not question:
+            st.info("I could not make out any words in that recording.")
 
-            st.session_state.rag_msgs.append({"role": "assistant", "text": answer})
-    else:
-        st.info("Upload a PDF above to get started.")
+if question:
+    st.session_state.rag_messages.append({"role": "user", "text": question})
+    with st.chat_message("user"):
+        st.markdown(question)
 
+    with st.chat_message("assistant"):
+        recorder = EventRecorder()
+        with st.status("Searching the document...", expanded=True) as status:
+            sink = fan_out(recorder, StatusRenderer(status, show_thoughts=False))
+            result = session.ask(question, sink=sink)
+            status.update(
+                label=f"Answered after {result.tool_calls} search(es)"
+                if result.ok
+                else "Something went wrong",
+                state="complete" if result.ok else "error",
+                expanded=False,
+            )
 
-if __name__ == "__main__":
-    main()
+        st.markdown(result.answer)
+
+        # Show the passages the agent actually retrieved, in the order it saw them.
+        sources = []
+        for event in recorder.of("tool_finished"):
+            if event.name == "search_documents" and event.ok:
+                query = next(
+                    (
+                        e.args.get("query", "")
+                        for e in recorder.of("tool_started")
+                        if e.call_id == event.call_id
+                    ),
+                    "",
+                )
+                sources.append({"label": f'search: "{query}"', "text": event.preview})
+
+        if sources:
+            with st.expander("Passages the answer was built from"):
+                for source in sources:
+                    st.markdown(f"**{source['label']}**")
+                    st.caption(source["text"])
+
+        if st.session_state.get("rag_voice_on"):
+            with st.spinner("Generating voice..."):
+                audio = session.speak(result.answer)
+            if audio:
+                st.audio(audio, format="audio/wav", autoplay=True)
+            else:
+                st.caption("Voice reply unavailable right now.")
+
+    st.session_state.rag_messages.append(
+        {"role": "assistant", "text": result.answer, "sources": sources}
+    )
